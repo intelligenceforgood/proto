@@ -12,6 +12,7 @@ from i4g.api.account_list import router as account_list_router
 from i4g.api.discovery import router as discovery_router
 from i4g.api.intake import router as intake_router
 from i4g.api.review import router as review_router
+from i4g.settings import get_settings
 
 # ----------------------------------------
 # Task Status API (Step 2 of M6.3)
@@ -66,6 +67,7 @@ def create_app() -> FastAPI:
 
 # For uvicorn, expose `app` at module level
 app = create_app()
+SETTINGS = get_settings()
 
 # ----------------------------------------
 # Simple Rate Limiting and Queue Control
@@ -73,7 +75,7 @@ app = create_app()
 
 # In-memory request log (in production, replace with Redis or PostgreSQL table)
 REQUEST_LOG = {}
-MAX_REQUESTS_PER_MINUTE = 10  # per IP or per analyst
+MAX_REQUESTS_PER_MINUTE = 0 if getattr(SETTINGS, "is_local", False) else 10
 
 
 @app.middleware("http")
@@ -82,6 +84,8 @@ async def rate_limit_middleware(request: Request, call_next):
     Basic per-IP rate limiter. Blocks clients that exceed
     MAX_REQUESTS_PER_MINUTE requests in a rolling 60s window.
     """
+    if MAX_REQUESTS_PER_MINUTE <= 0:
+        return await call_next(request)
     client_ip = request.headers.get("x-forwarded-for") or (request.client.host if request.client else "unknown")
     now = time.time()
     window_start = now - 60

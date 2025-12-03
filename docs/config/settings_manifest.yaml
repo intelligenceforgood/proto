@@ -1,4 +1,4 @@
-generated_at: '2025-12-01T21:35:08.578424+00:00'
+generated_at: '2025-12-02T16:30:10.376318+00:00'
 source: src/i4g/settings/config.py
 env_prefix: I4G_
 fields:
@@ -122,15 +122,6 @@ fields:
   section: identity
   type: str | NoneType
   default: null
-- path: search.schema_entity_example_limit
-  section: search
-  type: int
-  default: 5
-  env_vars:
-  - I4G_SEARCH__SCHEMA_ENTITY_EXAMPLE_LIMIT
-  - SEARCH_SCHEMA_ENTITY_EXAMPLE_LIMIT
-  - SEARCH__SCHEMA_ENTITY_EXAMPLE_LIMIT
-  description: Number of entity example values returned per type in the hybrid search schema payload.
   env_vars:
   - I4G_IDENTITY__AUDIENCE
   - IDENTITY_AUDIENCE
@@ -539,6 +530,26 @@ fields:
   - SEARCH_LOSS_BUCKETS
   - SEARCH__LOSS_BUCKETS
   description: Hybrid search tuning parameters and schema presets.
+- path: search.saved_search.migration_tag
+  section: search
+  type: str
+  default: hybrid-v1
+  env_vars:
+  - I4G_SEARCH__SAVED_SEARCH__MIGRATION_TAG
+  - SEARCH_SAVED_SEARCH_MIGRATION_TAG
+  - SEARCH__SAVED_SEARCH__MIGRATION_TAG
+  - SAVED_SEARCH_MIGRATION_TAG
+  description: Saved-search migration defaults shared across CLI scripts.
+- path: search.saved_search.schema_version
+  section: search
+  type: str
+  default: ''
+  env_vars:
+  - I4G_SEARCH__SAVED_SEARCH__SCHEMA_VERSION
+  - SEARCH_SAVED_SEARCH_SCHEMA_VERSION
+  - SEARCH__SAVED_SEARCH__SCHEMA_VERSION
+  - SAVED_SEARCH_SCHEMA_VERSION
+  description: Saved-search migration defaults shared across CLI scripts.
 - path: search.schema_cache_ttl_seconds
   section: search
   type: int
@@ -548,6 +559,15 @@ fields:
   - SEARCH_SCHEMA_CACHE_TTL
   - SEARCH__SCHEMA_CACHE_TTL
   description: Hybrid search tuning parameters and schema presets.
+- path: search.schema_entity_example_limit
+  section: search
+  type: int
+  default: 5
+  env_vars:
+  - I4G_SEARCH__SCHEMA_ENTITY_EXAMPLE_LIMIT
+  - SEARCH_SCHEMA_ENTITY_EXAMPLE_LIMIT
+  - SEARCH__SCHEMA_ENTITY_EXAMPLE_LIMIT
+  description: Hybrid search tuning parameters and schema presets.
 - path: search.semantic_weight
   section: search
   type: float
@@ -556,7 +576,7 @@ fields:
   - I4G_SEARCH__SEMANTIC_WEIGHT
   - SEARCH_SEMANTIC_WEIGHT
   - SEARCH__SEMANTIC_WEIGHT
-  description: Semantic score weight (0–1). At least one search weight must be greater than zero.
+  description: Hybrid search tuning parameters and schema presets.
 - path: search.structured_weight
   section: search
   type: float
@@ -565,7 +585,7 @@ fields:
   - I4G_SEARCH__STRUCTURED_WEIGHT
   - SEARCH_STRUCTURED_WEIGHT
   - SEARCH__STRUCTURED_WEIGHT
-  description: Structured score weight (0–1). At least one search weight must be greater than zero.
+  description: Hybrid search tuning parameters and schema presets.
 - path: search.time_presets
   section: search
   type: list[str]

@@ -80,6 +80,29 @@ def test_search_schema_entity_example_limit_override(monkeypatch: object) -> Non
     assert overridden.search.schema_entity_example_limit == 3
 
 
+def test_saved_search_settings_env_override(monkeypatch: object) -> None:
+    """Saved-search migration defaults must follow settings/env overrides."""
+
+    _clear_env(
+        monkeypatch,
+        "I4G_SEARCH__SAVED_SEARCH__MIGRATION_TAG",
+        "I4G_SEARCH__SAVED_SEARCH__SCHEMA_VERSION",
+        "SEARCH_SAVED_SEARCH_MIGRATION_TAG",
+        "SEARCH_SAVED_SEARCH_SCHEMA_VERSION",
+    )
+
+    defaults = reload_settings(env="dev")
+    assert defaults.search.saved_search.migration_tag == "hybrid-v1"
+    assert defaults.search.saved_search.schema_version == ""
+
+    _set_env(monkeypatch, "I4G_SEARCH__SAVED_SEARCH__MIGRATION_TAG", "hybrid-v2")
+    _set_env(monkeypatch, "I4G_SEARCH__SAVED_SEARCH__SCHEMA_VERSION", "schema-v3")
+
+    overridden = reload_settings(env="dev")
+    assert overridden.search.saved_search.migration_tag == "hybrid-v2"
+    assert overridden.search.saved_search.schema_version == "schema-v3"
+
+
 def test_llm_provider_env_override(monkeypatch: object) -> None:
     """Ensure the llm.provider value follows environment overrides."""
 

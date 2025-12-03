@@ -113,6 +113,7 @@ def test_search_merges_scores_and_applies_time_range(retriever_payload):
     assert response["structured_hits"] == 2
     diagnostics = response.get("diagnostics")
     assert diagnostics["score_policy"]["strategy"] == "max_weighted"
+    assert diagnostics["score_policy"]["tie_breaker"] == HybridSearchService.TIE_BREAKER
     assert diagnostics["counts"]["returned_results"] == 1
 
 
@@ -233,3 +234,128 @@ def test_weighted_scores_control_result_ordering():
     assert ordered_cases == ["structured-dominant", "semantic-first"]
     assert response["diagnostics"]["score_policy"]["semantic_weight"] == pytest.approx(0.2)
     assert response["diagnostics"]["score_policy"]["structured_weight"] == pytest.approx(0.8)
+
+
+def test_diagnostics_capture_overlap_and_time_filter_counts():
+    now = datetime.utcnow()
+    payload = {
+        "results": [
+            {
+                "case_id": "recent",
+                "sources": ["vector", "structured"],
+                "vector": {"similarity": 0.9},
+                "record": {
+                    "case_id": "recent",
+                    "confidence": 0.7,
+                    "created_at": now.isoformat(),
+                    "metadata": {"dataset": "retrieval_poc_dev"},
+                },
+            },
+            {
+                "case_id": "stale",
+                "sources": ["structured"],
+                "record": {
+                    "case_id": "stale",
+                    "confidence": 0.8,
+                    "created_at": (now - timedelta(days=60)).isoformat(),
+                    "metadata": {},
+                },
+            },
+        ],
+        "vector_hits": 3,
+        "structured_hits": 4,
+        "total": 2,
+    }
+    retriever = _StubRetriever(payload)
+    query = HybridSearchQuery(
+        time_range=QueryTimeRange(start=now - timedelta(days=1), end=now + timedelta(days=1)),
+        limit=5,
+    )
+    service = HybridSearchService(retriever=retriever, entity_store=_StubEntityStore())
+
+    response = service.search(query)
+
+    diagnostics = response["diagnostics"]
+    counts = diagnostics["counts"]
+    assert counts["merged_results"] == 2
+    assert counts["returned_results"] == 1
+    assert counts["dropped_by_time_range"] == 1
+    assert counts["deduped_overlap"] == 5  # vector_hits + structured_hits - merged_results
+    assert counts["source_breakdown"]["merged"] == 1
+    assert counts["source_breakdown"]["structured_only"] == 1
+
+
+def test_weighted_score_ties_prefer_structured_branch():
+    payload = {
+        "results": [
+            {
+                "case_id": "tie-case",
+                "sources": ["vector", "structured"],
+                "vector": {"similarity": 0.9},
+                "record": {
+                    "case_id": "tie-case",
+                    "confidence": 0.9,
+                    "metadata": {},
+                },
+            }
+        ],
+        "vector_hits": 1,
+        "structured_hits": 1,
+        "total": 1,
+    }
+    retriever = _StubRetriever(payload)
+    settings = reload_settings()
+    tuned_search = settings.search.model_copy(update={"semantic_weight": 0.5, "structured_weight": 0.5})
+    tuned_settings = settings.model_copy(update={"search": tuned_search})
+    service = HybridSearchService(retriever=retriever, settings=tuned_settings, entity_store=_StubEntityStore())
+
+    response = service.search(HybridSearchQuery(limit=5))
+
+    item = response["results"][0]
+    assert item["scores"]["winner"] == "structured"
+    assert item["merged_score"] == pytest.approx(0.45)
+    assert item["scores"]["semantic_weighted"] == pytest.approx(item["scores"]["structured_weighted"])
+    assert item["scores"].get("tie_breaker_applied") is True
+    diagnostics = response["diagnostics"]
+    assert diagnostics["score_policy"]["tie_breaker_applications"] == 1
+
+
+def test_score_policy_reports_winner_counts():
+    payload = {
+        "results": [
+            {
+                "case_id": "vector-win",
+                "sources": ["vector"],
+                "vector": {"similarity": 0.95},
+                "record": {
+                    "case_id": "vector-win",
+                    "confidence": 0.2,
+                    "metadata": {},
+                },
+            },
+            {
+                "case_id": "structured-win",
+                "sources": ["structured"],
+                "record": {
+                    "case_id": "structured-win",
+                    "confidence": 0.9,
+                    "metadata": {},
+                },
+            },
+        ],
+        "vector_hits": 2,
+        "structured_hits": 2,
+        "total": 2,
+    }
+    retriever = _StubRetriever(payload)
+    settings = reload_settings()
+    tuned_search = settings.search.model_copy(update={"semantic_weight": 0.8, "structured_weight": 0.6})
+    tuned_settings = settings.model_copy(update={"search": tuned_search})
+    service = HybridSearchService(retriever=retriever, settings=tuned_settings, entity_store=_StubEntityStore())
+
+    response = service.search(HybridSearchQuery(limit=5))
+
+    policy = response["diagnostics"]["score_policy"]
+    assert policy["winners"]["semantic"] == 1
+    assert policy["winners"]["structured"] == 1
+    assert policy["winners"]["unknown"] == 0

@@ -547,6 +547,29 @@ class AccountListSettings(BaseSettings):
     )
 
 
+class SavedSearchSettings(BaseSettings):
+    """Saved-search migration defaults shared across CLI scripts."""
+
+    model_config = SettingsConfigDict(extra="ignore", populate_by_name=True)
+
+    migration_tag: str = Field(
+        default="hybrid-v1",
+        validation_alias=AliasChoices(
+            "SEARCH_SAVED_SEARCH_MIGRATION_TAG",
+            "SEARCH__SAVED_SEARCH__MIGRATION_TAG",
+            "SAVED_SEARCH_MIGRATION_TAG",
+        ),
+    )
+    schema_version: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "SEARCH_SAVED_SEARCH_SCHEMA_VERSION",
+            "SEARCH__SAVED_SEARCH__SCHEMA_VERSION",
+            "SAVED_SEARCH_SCHEMA_VERSION",
+        ),
+    )
+
+
 class SearchSettings(BaseSettings):
     """Hybrid search tuning parameters and schema presets."""
 
@@ -605,6 +628,7 @@ class SearchSettings(BaseSettings):
             "SEARCH__SCHEMA_ENTITY_EXAMPLE_LIMIT",
         ),
     )
+    saved_search: SavedSearchSettings = Field(default_factory=SavedSearchSettings)
 
     @model_validator(mode="after")
     def _validate_weights(self) -> "SearchSettings":

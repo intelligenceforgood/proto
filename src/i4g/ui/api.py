@@ -221,6 +221,13 @@ def search_cases_api(
     return response.json()
 
 
+def search_cases_hybrid_api(payload: Dict[str, Any]) -> Dict[str, Any]:
+    client = reviews_client()
+    response = client.post("/search/query", json=payload)
+    response.raise_for_status()
+    return response.json()
+
+
 def fetch_case_reviews(case_id: str, limit: int = 5) -> Dict[str, Any]:
     client = reviews_client()
     response = client.get(f"/case/{case_id}", params={"limit": limit})
@@ -238,6 +245,15 @@ def fetch_search_history(limit: int = 10) -> Dict[str, Any]:
 def fetch_saved_searches(limit: int = 25, owner_only: bool = False) -> Dict[str, Any]:
     client = reviews_client()
     response = client.get("/search/saved", params={"limit": limit, "owner_only": owner_only})
+    response.raise_for_status()
+    return response.json()
+
+
+def fetch_search_schema() -> Dict[str, Any]:
+    """Retrieve the hybrid-search schema description from the API."""
+
+    client = reviews_client()
+    response = client.get("/search/schema")
     response.raise_for_status()
     return response.json()
 
@@ -390,6 +406,7 @@ __all__ = [
     "search_cases_api",
     "fetch_case_reviews",
     "fetch_search_history",
+    "fetch_search_schema",
     "fetch_saved_searches",
     "save_search",
     "patch_saved_search",

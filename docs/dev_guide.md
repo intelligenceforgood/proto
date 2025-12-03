@@ -123,6 +123,30 @@ I4G_API_KEY=dev-analyst-token
 I4G_VECTOR_BACKEND=chroma
 ```
 
+### Local sandbox env vars (FastAPI, Streamlit, Next.js)
+
+When the sandbox services cannot find the expected API base/key, they usually crash with cryptic errors (Streamlit shows
+`ConnectionError: Failed to reach API`, the Next.js console surfaces `fetch failed`, and FastAPI background workers log
+`NoneType` attribute errors). Avoid that loop by defining the following variables before starting any of the local apps.
+Use a `.env.local` file or export them in the same shell session:
+
+| Service | Launch command | Required env vars |
+| --- | --- | --- |
+| **FastAPI** | `conda run -n i4g uvicorn i4g.api.app:app --reload` | `I4G_ENV=local`, `I4G_API_URL=http://127.0.0.1:8000`, `I4G_API_KEY=dev-analyst-token` |
+| **Streamlit dashboard** | `conda run -n i4g streamlit run src/i4g/ui/analyst_dashboard.py` | All FastAPI vars **plus** `I4G_API_KIND=proto` so the dashboard uses the proto search contract |
+| **Next.js analyst console** | `pnpm --filter web dev` | Same API vars as above, `I4G_API_KIND=proto`, and set `NEXT_PUBLIC_USE_MOCK_DATA=false` so the console skips the mock client |
+
+Additional tips:
+
+- Keep `I4G_ENV=local` for all sandbox runs; it forces SQLite/Chroma backends and mock identity.
+- If you need to point the console or Streamlit at `i4g-dev`, override `I4G_ENV=dev` **and** supply the matching
+    `I4G_API_KEY` (for example from Secret Manager). Missing keys produce `401 Unauthorized` loops in both UIs.
+- Add these exports to `.env.local` (proto) and `.env.local` inside `ui/apps/web/` if you frequently switch between
+    services; both repos load the files automatically via `python-dotenv` / Next.js env loaders.
+- Whenever you see Playwright/Vitest failures about `fetch` or Streamlit reports "API unavailable", re-check that
+    `I4G_API_URL` and `I4G_API_KEY` are present in the environment running that command (VS Code tasks do not inherit
+    shell profiles by default).
+
 ### TOML configuration files
 
 When you find yourself exporting a dozen env vars before every command, move

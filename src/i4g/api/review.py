@@ -11,14 +11,15 @@ Endpoints:
 """
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from i4g.api.auth import require_token
 from i4g.services.hybrid_search import HybridSearchQuery, HybridSearchService, QueryEntityFilter, QueryTimeRange
+from i4g.settings import get_settings
 from i4g.store.retriever import HybridRetriever
 from i4g.store.review_store import ReviewStore
 
@@ -26,6 +27,7 @@ from i4g.store.review_store import ReviewStore
 from i4g.worker.tasks import generate_report_for_case
 
 router = APIRouter()
+SETTINGS = get_settings()
 
 # Pydantic models for request/response payloads
 
@@ -100,6 +102,10 @@ class HybridSearchRequest(BaseModel):
     vector_limit: Optional[int] = Field(default=None, ge=1, le=100)
     structured_limit: Optional[int] = Field(default=None, ge=1, le=100)
     offset: int = Field(default=0, ge=0)
+    saved_search_id: Optional[str] = None
+    saved_search_name: Optional[str] = None
+    saved_search_owner: Optional[str] = None
+    saved_search_tags: List[str] = Field(default_factory=list)
 
 
 class BulkTagUpdateRequest(BaseModel):
@@ -189,6 +195,7 @@ def search_cases(
     query_result = search_service.search(query)
     results = query_result["results"]
     diagnostics = query_result.get("diagnostics")
+    diag_counts = diagnostics.get("counts", {}) if isinstance(diagnostics, dict) else {}
     search_id = f"search:{uuid.uuid4()}"
     store.log_action(
         review_id="search",
@@ -208,6 +215,8 @@ def search_cases(
             "total": query_result["total"],
             "vector_hits": query_result.get("vector_hits"),
             "structured_hits": query_result.get("structured_hits"),
+            "merged_results": diag_counts.get("merged_results"),
+            "source_breakdown": diag_counts.get("source_breakdown"),
             "diagnostics": diagnostics,
         },
     )
@@ -220,6 +229,8 @@ def search_cases(
         "total": query_result["total"],
         "vector_hits": query_result.get("vector_hits"),
         "structured_hits": query_result.get("structured_hits"),
+        "merged_results": diag_counts.get("merged_results"),
+        "source_breakdown": diag_counts.get("source_breakdown"),
         "diagnostics": diagnostics,
         "search_id": search_id,
     }
@@ -246,19 +257,35 @@ def search_cases_advanced(
     query = _build_hybrid_query_from_request(payload)
     query_result = search_service.search(query)
     search_id = f"search:{uuid.uuid4()}"
+    diagnostics = query_result.get("diagnostics")
+    diag_counts = diagnostics.get("counts", {}) if isinstance(diagnostics, dict) else {}
+    saved_search_descriptor = _build_saved_search_descriptor(payload)
+    log_payload: Dict[str, Any] = {
+        "search_id": search_id,
+        "request": payload.model_dump(),
+        "results_count": query_result["count"],
+        "total": query_result["total"],
+        "vector_hits": query_result.get("vector_hits"),
+        "structured_hits": query_result.get("structured_hits"),
+        "merged_results": diag_counts.get("merged_results"),
+        "source_breakdown": diag_counts.get("source_breakdown"),
+        "diagnostics": diagnostics,
+    }
+    if saved_search_descriptor:
+        log_payload["saved_search"] = saved_search_descriptor
+        if saved_search_descriptor.get("id"):
+            log_payload["saved_search_id"] = saved_search_descriptor["id"]
+        if saved_search_descriptor.get("name"):
+            log_payload["saved_search_name"] = saved_search_descriptor["name"]
+        if saved_search_descriptor.get("owner"):
+            log_payload["saved_search_owner"] = saved_search_descriptor["owner"]
+        if saved_search_descriptor.get("tags"):
+            log_payload["saved_search_tags"] = saved_search_descriptor["tags"]
     store.log_action(
         review_id="search",
         actor=user["username"],
         action="search",
-        payload={
-            "search_id": search_id,
-            "request": payload.model_dump(),
-            "results_count": query_result["count"],
-            "total": query_result["total"],
-            "vector_hits": query_result.get("vector_hits"),
-            "structured_hits": query_result.get("structured_hits"),
-            "diagnostics": query_result.get("diagnostics"),
-        },
+        payload=log_payload,
     )
     return {**query_result, "search_id": search_id}
 
@@ -277,10 +304,11 @@ def save_search(
     store: ReviewStore = Depends(get_store),
     user=Depends(require_token),
 ):
+    params = _normalize_saved_search_params(payload.params)
     try:
         search_id = store.upsert_saved_search(
             payload.name,
-            payload.params,
+            params,
             owner=user.get("username"),
             search_id=payload.search_id,
             favorite=payload.favorite or False,
@@ -309,7 +337,16 @@ def list_saved_searches(
     user=Depends(require_token),
 ):
     owner = user.get("username") if owner_only else None
-    items = store.list_saved_searches(owner=owner, limit=limit)
+    raw_items = store.list_saved_searches(owner=owner, limit=limit)
+    items = []
+    for entry in raw_items:
+        params = entry.get("params") if isinstance(entry, dict) else None
+        if isinstance(entry, dict):
+            normalized = dict(entry)
+            normalized["params"] = _normalize_saved_search_params(params or {}, strict=False)
+            items.append(normalized)
+        else:
+            items.append(entry)
     return {"items": items, "count": len(items)}
 
 
@@ -363,11 +400,12 @@ def patch_saved_search(
     store: ReviewStore = Depends(get_store),
     user=Depends(require_token),
 ):
+    params = _normalize_saved_search_params(payload.params) if payload.params is not None else None
     try:
         updated = store.update_saved_search(
             search_id,
             name=payload.name,
-            params=payload.params,
+            params=params,
             favorite=payload.favorite,
             tags=payload.tags,
         )
@@ -422,6 +460,7 @@ def export_saved_search(
     record = store.get_saved_search(search_id)
     if not record:
         raise HTTPException(status_code=404, detail="Saved search not found")
+    record["params"] = _normalize_saved_search_params(record.get("params") or {}, strict=False)
     return record
 
 
@@ -431,8 +470,10 @@ def import_saved_search(
     store: ReviewStore = Depends(get_store),
     user=Depends(require_token),
 ):
+    record = payload.model_dump()
+    record["params"] = _normalize_saved_search_params(record["params"])
     try:
-        search_id = store.import_saved_search(payload.model_dump(), owner=user.get("username"))
+        search_id = store.import_saved_search(record, owner=user.get("username"))
     except ValueError as exc:
         msg = str(exc)
         if msg.startswith("duplicate_saved_search"):
@@ -495,6 +536,263 @@ def _build_hybrid_query_from_request(payload: HybridSearchRequest) -> HybridSear
         structured_limit=payload.structured_limit,
         offset=payload.offset,
     )
+
+
+def _build_saved_search_descriptor(payload: HybridSearchRequest) -> Dict[str, Any] | None:
+    tags: List[str] = []
+    for tag in payload.saved_search_tags or []:
+        text = _clean_text_value(tag)
+        if text:
+            tags.append(text)
+
+    descriptor: Dict[str, Any] = {
+        "id": _clean_text_value(payload.saved_search_id),
+        "name": _clean_text_value(payload.saved_search_name),
+        "owner": _clean_text_value(payload.saved_search_owner),
+        "tags": tags,
+    }
+
+    if descriptor["id"] or descriptor["name"] or descriptor["owner"] or descriptor["tags"]:
+        return descriptor
+    return None
+
+
+def _normalize_saved_search_params(params: Dict[str, Any], *, strict: bool = True) -> Dict[str, Any]:
+    if not isinstance(params, dict):
+        if strict:
+            raise HTTPException(status_code=400, detail="Saved search params must be an object")
+        return _apply_saved_search_schema_version({})
+
+    try:
+        request_model = _build_saved_search_request(params)
+    except HTTPException:
+        if strict:
+            raise
+        return _apply_saved_search_schema_version(dict(params))
+    except ValidationError as exc:  # Safety net when coercion fails downstream
+        if strict:
+            raise HTTPException(status_code=400, detail=f"Invalid saved search params: {exc.errors()[0]['msg']}")
+        return _apply_saved_search_schema_version(dict(params))
+
+    normalized = request_model.model_dump(exclude_none=True)
+    normalized = _post_process_saved_search_params(normalized, params)
+    normalized = _apply_saved_search_schema_version(normalized, provided=params.get("schema_version"))
+    return normalized
+
+
+def _saved_search_schema_version_default() -> str | None:
+    configured = (SETTINGS.search.saved_search.schema_version or "").strip()
+    if configured:
+        return configured
+    fallback = (SETTINGS.search.saved_search.migration_tag or "").strip()
+    return fallback or None
+
+
+def _build_saved_search_request(params: Dict[str, Any]) -> HybridSearchRequest:
+    payload: Dict[str, Any] = {}
+
+    payload["text"] = _clean_text_value(params.get("text"))
+    payload["classifications"] = _coerce_string_list(params.get("classifications"), params.get("classification"))
+    payload["datasets"] = _coerce_string_list(params.get("datasets"))
+    payload["loss_buckets"] = _coerce_string_list(params.get("loss_buckets"))
+    payload["case_ids"] = _coerce_string_list(params.get("case_ids"), params.get("case_id"))
+    payload["entities"] = _coerce_entities(params.get("entities"))
+
+    time_range = _coerce_time_range(params.get("time_range"))
+    if time_range:
+        payload["time_range"] = time_range
+
+    limit = _coerce_positive_int(params.get("limit"), max_value=100)
+    if not limit:
+        limit = _coerce_positive_int(params.get("page_size"), max_value=100)
+    if not limit:
+        limit = min(SETTINGS.search.default_limit, 100)
+    payload["limit"] = limit
+    payload["vector_limit"] = _coerce_positive_int(params.get("vector_limit"), max_value=100) or limit
+    payload["structured_limit"] = _coerce_positive_int(params.get("structured_limit"), max_value=100) or limit
+    payload["offset"] = _coerce_positive_int(params.get("offset"), allow_zero=True, max_value=10_000) or 0
+
+    return HybridSearchRequest(**payload)
+
+
+def _post_process_saved_search_params(normalized: Dict[str, Any], original: Dict[str, Any]) -> Dict[str, Any]:
+    result = dict(normalized)
+
+    # Preserve legacy scalar fields for older clients
+    classification_value = _first_value(result.get("classifications"), original.get("classification"))
+    if classification_value:
+        result["classification"] = classification_value
+
+    case_value = _first_value(result.get("case_ids"), original.get("case_id"))
+    if case_value:
+        result["case_id"] = case_value
+
+    # Align limit/page size defaults
+    provided_page_size = _coerce_positive_int(original.get("page_size"), max_value=100)
+    if provided_page_size:
+        result["page_size"] = provided_page_size
+        result.setdefault("limit", provided_page_size)
+    else:
+        result.setdefault("page_size", result.get("limit"))
+
+    result["vector_limit"] = result.get("vector_limit") or result.get("limit")
+    result["structured_limit"] = result.get("structured_limit") or result.get("limit")
+
+    # Ensure lists exist for downstream UI expectations
+    for field in ("classifications", "datasets", "loss_buckets", "case_ids", "entities"):
+        result[field] = result.get(field) or []
+
+    if result.get("time_range"):
+        tr = result["time_range"]
+        result["time_range"] = {
+            "start": tr["start"].isoformat() if isinstance(tr["start"], datetime) else tr["start"],
+            "end": tr["end"].isoformat() if isinstance(tr["end"], datetime) else tr["end"],
+        }
+
+    return result
+
+
+def _apply_saved_search_schema_version(params: Dict[str, Any], provided: Any | None = None) -> Dict[str, Any]:
+    normalized = dict(params)
+    candidates = []
+    if provided is not None:
+        candidates.append(provided)
+    if "schema_version" in normalized:
+        candidates.append(normalized["schema_version"])
+    version_value = ""
+    for candidate in candidates:
+        if isinstance(candidate, str):
+            version_value = candidate.strip()
+        elif candidate is not None:
+            version_value = str(candidate).strip()
+        if version_value:
+            break
+
+    if version_value:
+        normalized["schema_version"] = version_value
+        return normalized
+
+    fallback = _saved_search_schema_version_default()
+    if fallback:
+        normalized["schema_version"] = fallback
+    else:
+        normalized.pop("schema_version", None)
+    return normalized
+
+
+def _coerce_string_list(*values: Any) -> List[str]:
+    result: List[str] = []
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                text = _clean_text_value(item)
+                if text:
+                    result.append(text)
+        else:
+            text = _clean_text_value(value)
+            if text:
+                result.append(text)
+    # Remove duplicates while preserving order
+    seen = set()
+    unique: List[str] = []
+    for item in result:
+        lowered = item.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        unique.append(item)
+    return unique
+
+
+def _coerce_entities(raw: Any) -> List[Dict[str, str]]:
+    if not raw:
+        return []
+    normalized: List[Dict[str, str]] = []
+    match_modes = {"exact", "prefix", "contains"}
+    candidates = raw if isinstance(raw, list) else [raw]
+    for entry in candidates:
+        if isinstance(entry, dict):
+            entity_type = _clean_text_value(entry.get("type"))
+            entity_value = _clean_text_value(entry.get("value"))
+            if not entity_type or not entity_value:
+                continue
+            match_mode = _clean_text_value(entry.get("match_mode")) or "exact"
+            if match_mode not in match_modes:
+                match_mode = "exact"
+            normalized.append({"type": entity_type, "value": entity_value, "match_mode": match_mode})
+        elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
+            entity_type = _clean_text_value(entry[0])
+            entity_value = _clean_text_value(entry[1])
+            if not entity_type or not entity_value:
+                continue
+            normalized.append({"type": entity_type, "value": entity_value, "match_mode": "exact"})
+    return normalized
+
+
+def _coerce_time_range(raw: Any) -> Dict[str, datetime] | None:
+    if not isinstance(raw, dict):
+        return None
+    start_value = raw.get("start") or raw.get("from")
+    end_value = raw.get("end") or raw.get("to")
+    if not start_value or not end_value:
+        return None
+    start_dt = _parse_datetime(start_value)
+    end_dt = _parse_datetime(end_value)
+    if not start_dt or not end_dt or end_dt < start_dt:
+        return None
+    return {"start": start_dt, "end": end_dt}
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _coerce_positive_int(value: Any, *, allow_zero: bool = False, max_value: int | None = None) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    if number < 0 or (number == 0 and not allow_zero):
+        return None
+    if max_value is not None and number > max_value:
+        return max_value
+    return number
+
+
+def _first_value(*candidates: Any) -> Optional[str]:
+    for candidate in candidates:
+        text = _clean_text_value(candidate)
+        if text:
+            return text
+    return None
+
+
+def _clean_text_value(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    if isinstance(value, (int, float)):
+        return str(value)
+    return None
 
 
 @router.post("/{review_id}/claim", summary="Claim a review")

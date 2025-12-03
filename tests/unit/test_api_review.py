@@ -10,7 +10,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from i4g.api.app import app
-from i4g.api.review import get_retriever, get_store
+from i4g.api.review import SETTINGS, get_hybrid_search_service, get_retriever, get_store
+from i4g.services.hybrid_search import HybridSearchService
 
 client = TestClient(app)
 
@@ -43,7 +44,20 @@ def make_mock_store():
             "review_id": "search",
             "actor": "analyst_1",
             "action": "search",
-            "payload": {"search_id": "search:abc", "text": "wallet"},
+            "payload": {
+                "search_id": "search:abc",
+                "text": "wallet",
+                "saved_search": {
+                    "id": "saved:wallets",
+                    "name": "Wallet Sweep",
+                    "owner": "analyst_1",
+                    "tags": ["wallets", "crypto"],
+                },
+                "saved_search_id": "saved:wallets",
+                "saved_search_name": "Wallet Sweep",
+                "saved_search_owner": "analyst_1",
+                "saved_search_tags": ["wallets", "crypto"],
+            },
             "created_at": "2024-01-01T00:00:00Z",
         }
     ]
@@ -106,6 +120,10 @@ def test_search_cases_returns_combined_results():
     mock_store = make_mock_store()
     app.dependency_overrides[get_retriever] = lambda: mock_retriever
     app.dependency_overrides[get_store] = lambda: mock_store
+    app.dependency_overrides[get_hybrid_search_service] = lambda: HybridSearchService(
+        retriever=mock_retriever,
+        entity_store=MagicMock(),
+    )
 
     headers = {"X-API-KEY": "dev-analyst-token"}
     r = client.get(
@@ -129,11 +147,16 @@ def test_search_cases_returns_combined_results():
     assert payload["total"] == mock_retriever.query.return_value["total"]
     assert payload["vector_hits"] == mock_retriever.query.return_value["vector_hits"]
     assert payload["structured_hits"] == mock_retriever.query.return_value["structured_hits"]
+    assert "merged_results" in payload
+    assert "source_breakdown" in payload
+    counts = payload["diagnostics"]["counts"]
+    assert payload["merged_results"] == counts.get("merged_results")
+    assert payload["source_breakdown"] == counts.get("source_breakdown")
     assert payload["search_id"].startswith("search:")
     assert payload["results"][0]["case_id"] == "CASE-A"
     mock_retriever.query.assert_called_once_with(
         text="wallet",
-        filters={"classification": "crypto_investment"},
+        filters=[("classification", "crypto_investment")],
         vector_top_k=7,
         structured_top_k=3,
         offset=2,
@@ -141,6 +164,9 @@ def test_search_cases_returns_combined_results():
     )
 
     mock_store.log_action.assert_called_once()
+    logged_payload = mock_store.log_action.call_args.kwargs["payload"]
+    assert logged_payload["merged_results"] == counts.get("merged_results")
+    assert logged_payload["source_breakdown"] == counts.get("source_breakdown")
 
     app.dependency_overrides = {}
 
@@ -179,6 +205,71 @@ def test_search_history_returns_recent_events():
     app.dependency_overrides = {}
 
 
+def test_search_history_includes_saved_search_descriptor():
+    mock_store = make_mock_store()
+    app.dependency_overrides[get_store] = lambda: mock_store
+
+    headers = {"X-API-KEY": "dev-analyst-token"}
+    response = client.get("/reviews/search/history", params={"limit": 1}, headers=headers)
+    assert response.status_code == 200
+    event = response.json()["events"][0]
+    payload = event["payload"]
+    descriptor = payload.get("saved_search")
+    assert descriptor is not None
+    assert descriptor["id"] == "saved:wallets"
+    assert descriptor["name"] == "Wallet Sweep"
+    assert descriptor["owner"] == "analyst_1"
+    assert descriptor["tags"] == ["wallets", "crypto"]
+    assert payload["saved_search_id"] == "saved:wallets"
+    assert payload["saved_search_name"] == "Wallet Sweep"
+    assert payload["saved_search_owner"] == "analyst_1"
+    assert payload["saved_search_tags"] == ["wallets", "crypto"]
+
+    app.dependency_overrides = {}
+
+
+def test_search_query_logs_saved_search_descriptor():
+    mock_store = make_mock_store()
+    mock_service = MagicMock()
+    mock_service.search.return_value = {
+        "results": [],
+        "count": 0,
+        "total": 0,
+        "vector_hits": 0,
+        "structured_hits": 0,
+        "diagnostics": {"counts": {}},
+    }
+    app.dependency_overrides[get_store] = lambda: mock_store
+    app.dependency_overrides[get_hybrid_search_service] = lambda: mock_service
+
+    headers = {"X-API-KEY": "dev-analyst-token"}
+    payload = {
+        "text": "wallet",
+        "saved_search_id": "saved:abc",
+        "saved_search_name": "High-risk wallets",
+        "saved_search_owner": "analyst_1",
+        "saved_search_tags": ["wallets", "crypto "],
+    }
+
+    response = client.post("/reviews/search/query", json=payload, headers=headers)
+    assert response.status_code == 200
+
+    assert mock_store.log_action.called
+    _, kwargs = mock_store.log_action.call_args
+    logged_payload = kwargs["payload"]
+    saved_search = logged_payload.get("saved_search")
+    assert saved_search is not None
+    assert saved_search["id"] == "saved:abc"
+    assert saved_search["name"] == "High-risk wallets"
+    assert saved_search["owner"] == "analyst_1"
+    assert saved_search["tags"] == ["wallets", "crypto"]
+    assert logged_payload["saved_search_id"] == "saved:abc"
+    assert logged_payload["saved_search_name"] == "High-risk wallets"
+    assert logged_payload["saved_search_owner"] == "analyst_1"
+
+    app.dependency_overrides = {}
+
+
 def test_saved_search_crud():
     mock_store = make_mock_store()
     app.dependency_overrides[get_store] = lambda: mock_store
@@ -192,14 +283,17 @@ def test_saved_search_crud():
     mock_store.upsert_saved_search.return_value = "saved:123"
     r = client.post("/reviews/search/saved", json=payload, headers=headers)
     assert r.status_code == 200
-    mock_store.upsert_saved_search.assert_called_once_with(
-        payload["name"],
-        payload["params"],
-        owner="analyst_1",
-        search_id=None,
-        favorite=False,
-        tags=payload["tags"],
-    )
+    assert mock_store.upsert_saved_search.call_count == 1
+    saved_params = mock_store.upsert_saved_search.call_args.args[1]
+    expected_limit = min(SETTINGS.search.default_limit, 100)
+    assert saved_params["schema_version"] == "hybrid-v1"
+    assert saved_params["text"] == "wallet"
+    assert saved_params["classification"] == "crypto"
+    assert saved_params["classifications"] == ["crypto"]
+    assert saved_params["limit"] == expected_limit
+    assert saved_params["page_size"] == expected_limit
+    assert saved_params["vector_limit"] == expected_limit
+    assert saved_params["structured_limit"] == expected_limit
 
     r_json = r.json()
     assert "search_id" in r_json
@@ -238,6 +332,33 @@ def test_saved_search_crud():
     app.dependency_overrides = {}
 
 
+def test_saved_search_patch_normalizes_params():
+    mock_store = make_mock_store()
+    app.dependency_overrides[get_store] = lambda: mock_store
+
+    headers = {"X-API-KEY": "dev-analyst-token"}
+    mock_store.update_saved_search.return_value = True
+    patch_payload = {
+        "params": {"text": "wallet", "datasets": ["retrieval_poc_dev"]},
+        "favorite": True,
+    }
+
+    r = client.patch("/reviews/search/saved/saved:999", json=patch_payload, headers=headers)
+    assert r.status_code == 200
+    mock_store.update_saved_search.assert_called_once()
+    _, kwargs = mock_store.update_saved_search.call_args
+    assert kwargs["name"] is None
+    assert kwargs["favorite"] is True
+    assert kwargs["tags"] is None
+    normalized_params = kwargs["params"]
+    assert normalized_params["datasets"] == ["retrieval_poc_dev"]
+    assert normalized_params["schema_version"] == "hybrid-v1"
+    assert normalized_params["page_size"] == normalized_params["limit"]
+    assert normalized_params["vector_limit"] == normalized_params["limit"]
+
+    app.dependency_overrides = {}
+
+
 def test_saved_search_duplicate_handling_returns_409():
     mock_store = make_mock_store()
     mock_store.upsert_saved_search.side_effect = ValueError("duplicate_saved_search:analyst_1")
@@ -248,6 +369,33 @@ def test_saved_search_duplicate_handling_returns_409():
     r = client.post("/reviews/search/saved", json=payload, headers=headers)
     assert r.status_code == 409
     assert r.json()["detail"] == "Saved search name already exists (owner=analyst_1)"
+
+    app.dependency_overrides = {}
+
+
+def test_list_saved_searches_normalizes_params():
+    mock_store = make_mock_store()
+    legacy_params = {"classification": "romance", "page_size": 10}
+    mock_store.list_saved_searches.return_value = [
+        {
+            "search_id": "saved:legacy",
+            "name": "Legacy",
+            "params": legacy_params,
+            "owner": "analyst_1",
+        }
+    ]
+    app.dependency_overrides[get_store] = lambda: mock_store
+
+    headers = {"X-API-KEY": "dev-analyst-token"}
+    response = client.get("/reviews/search/saved", headers=headers)
+    assert response.status_code == 200
+    payload = response.json()
+    saved_params = payload["items"][0]["params"]
+    assert saved_params["classifications"] == ["romance"]
+    assert saved_params["classification"] == "romance"
+    assert saved_params["limit"] == 10
+    assert saved_params["page_size"] == 10
+    assert saved_params["schema_version"] == "hybrid-v1"
 
     app.dependency_overrides = {}
 
@@ -364,6 +512,23 @@ def test_import_saved_search_endpoint_handles_duplicates():
     r = client.post("/reviews/search/saved/import", json=payload, headers=headers)
     assert r.status_code == 409
     assert "Saved search name already exists" in r.json()["detail"]
+
+    app.dependency_overrides = {}
+
+
+def test_import_saved_search_injects_schema_version():
+    mock_store = make_mock_store()
+    mock_store.import_saved_search.return_value = "saved:new"
+    app.dependency_overrides[get_store] = lambda: mock_store
+
+    headers = {"X-API-KEY": "dev-analyst-token"}
+    payload = {"name": "Wallet", "params": {"text": "wallet"}, "favorite": True}
+    r = client.post("/reviews/search/saved/import", json=payload, headers=headers)
+    assert r.status_code == 200
+    args, kwargs = mock_store.import_saved_search.call_args
+    record = args[0]
+    assert record["params"]["schema_version"] == "hybrid-v1"
+    assert kwargs["owner"] == "analyst_1"
 
     app.dependency_overrides = {}
 

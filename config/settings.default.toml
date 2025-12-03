@@ -40,3 +40,7 @@
 # indicator_types = ["bank_account", "crypto_wallet", "email", "phone", "ip_address"]
 # dataset_presets = ["retrieval_poc_dev", "account_list"]
 # classification_presets = ["romance", "pig_butcher", "tech_support"]
+
+[search.saved_search]
+# migration_tag = "hybrid-v1"
+# schema_version = ""

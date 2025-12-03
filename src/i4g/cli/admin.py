@@ -175,10 +175,16 @@ def export_saved_searches(args: argparse.Namespace) -> None:
     include_tags = set(t.strip().lower() for t in (args.include_tags or []))
     if include_tags:
         records = [r for r in records if include_tags.intersection({t.lower() for t in (r.get("tags") or [])})]
+    schema_version = args.schema_version.strip() if getattr(args, "schema_version", None) else ""
     for record in records:
         record.pop("created_at", None)
         if record.get("tags") is None:
             record["tags"] = []
+        if schema_version:
+            params = record.get("params") or {}
+            if isinstance(params, dict):
+                params["schema_version"] = schema_version
+                record["params"] = params
     if args.split and args.output:
         base = Path(args.output)
         base.mkdir(parents=True, exist_ok=True)
@@ -434,6 +440,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--include-tags",
         nargs="*",
         help="Only export saved searches matching these tags (case-insensitive).",
+    )
+    export.add_argument(
+        "--schema-version",
+        default=SETTINGS.search.saved_search.schema_version,
+        help="Optional schema version to inject into each exported search params.",
     )
     export.set_defaults(func=export_saved_searches)
 

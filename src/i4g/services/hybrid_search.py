@@ -54,7 +54,7 @@ class HybridSearchItem:
     case_id: str
     sources: List[str]
     merged_score: float | None
-    scores: Dict[str, float]
+    scores: Dict[str, Any]
     record: Dict[str, Any] | None = None
     vector: Dict[str, Any] | None = None
     metadata: Dict[str, Any] | None = None
@@ -96,6 +96,7 @@ class HybridSearchService:
     """Coordinate hybrid search queries across vector + structured stores."""
 
     SCORE_STRATEGY = "max_weighted"
+    TIE_BREAKER = "structured_preference"
     _TIE_EPSILON = 1e-9
 
     def __init__(
@@ -147,8 +148,11 @@ class HybridSearchService:
         )
 
         raw_results = raw["results"]
-        items = [self._normalize_result(result) for result in raw_results]
-        total_before_filters = raw.get("total", len(items))
+        normalized_items = [self._normalize_result(result) for result in raw_results]
+        score_breakdown = self._score_breakdown(normalized_items)
+        source_breakdown = self._source_breakdown(raw_results)
+        total_before_filters = raw.get("total", len(normalized_items))
+        items = normalized_items
         if query.time_range:
             items = self._filter_by_time_range(items, query.time_range)
 
@@ -161,6 +165,8 @@ class HybridSearchService:
             filtered_count=len(items),
             limit=limit,
             query=query,
+            source_breakdown=source_breakdown,
+            score_breakdown=score_breakdown,
         )
 
         vector_hits = int(raw.get("vector_hits", 0) or 0)
@@ -326,13 +332,13 @@ class HybridSearchService:
             return None
         return 1.0 / (1.0 + value)
 
-    def _combine_scores(
-        self, semantic: float | None, structured: float | None
-    ) -> tuple[float | None, Dict[str, float]]:
+    def _combine_scores(self, semantic: float | None, structured: float | None) -> tuple[float | None, Dict[str, Any]]:
         weights = self.settings.search
-        scores: Dict[str, float] = {}
+        scores: Dict[str, Any] = {}
         semantic_weighted: float | None = None
         structured_weighted: float | None = None
+        tie_breaker_applied = False
+        comparison_delta: float | None = None
 
         if semantic is not None and weights.semantic_weight > 0:
             scores["semantic"] = semantic
@@ -357,7 +363,13 @@ class HybridSearchService:
             winner = "structured"
             merged_score = structured_weighted
         else:
-            if semantic_weighted > structured_weighted + self._TIE_EPSILON:
+            if semantic_weighted is not None and structured_weighted is not None:
+                comparison_delta = abs(semantic_weighted - structured_weighted)
+            if comparison_delta is not None and comparison_delta <= self._TIE_EPSILON:
+                winner = "structured"
+                merged_score = structured_weighted
+                tie_breaker_applied = True
+            elif semantic_weighted > structured_weighted + self._TIE_EPSILON:
                 winner = "semantic"
                 merged_score = semantic_weighted
             elif structured_weighted > semantic_weighted + self._TIE_EPSILON:
@@ -366,10 +378,16 @@ class HybridSearchService:
             else:
                 winner = "structured"
                 merged_score = structured_weighted
+                tie_breaker_applied = True
 
         scores["winner"] = winner or "unknown"
         if merged_score is not None:
             scores["merged_contribution"] = merged_score
+        if comparison_delta is not None:
+            scores["comparison_delta"] = comparison_delta
+        if tie_breaker_applied:
+            scores["tie_breaker_applied"] = True
+            scores["tie_breaker"] = self.TIE_BREAKER
         return merged_score, scores
 
     @staticmethod
@@ -480,6 +498,8 @@ class HybridSearchService:
         filtered_count: int,
         limit: int,
         query: HybridSearchQuery,
+        source_breakdown: Dict[str, int],
+        score_breakdown: Dict[str, Any],
     ) -> Dict[str, Any]:
         vector_hits = int(raw_payload.get("vector_hits", 0) or 0)
         structured_hits = int(raw_payload.get("structured_hits", 0) or 0)
@@ -489,8 +509,11 @@ class HybridSearchService:
         return {
             "score_policy": {
                 "strategy": self.SCORE_STRATEGY,
+                "tie_breaker": self.TIE_BREAKER,
                 "semantic_weight": self.settings.search.semantic_weight,
                 "structured_weight": self.settings.search.structured_weight,
+                "winners": score_breakdown.get("winners", {}),
+                "tie_breaker_applications": score_breakdown.get("tie_breaker_applied", 0),
             },
             "counts": {
                 "vector_hits": vector_hits,
@@ -501,6 +524,7 @@ class HybridSearchService:
                 "dropped_by_time_range": dropped_by_time,
                 "query_offset": query.offset,
                 "query_limit": limit,
+                "source_breakdown": source_breakdown,
             },
         }
 
@@ -533,6 +557,7 @@ class HybridSearchService:
                 "structured_hits": structured_hits,
                 "total": total,
                 "returned": returned,
+                "source_breakdown": diagnostics.get("counts", {}).get("source_breakdown"),
             },
             "score_policy": diagnostics.get("score_policy"),
         }
@@ -554,4 +579,64 @@ class HybridSearchService:
                 "structured_limit": query.structured_limit,
                 "offset": query.offset,
             },
+        }
+
+    @staticmethod
+    def _source_breakdown(results: Sequence[Dict[str, Any]]) -> Dict[str, int]:
+        """Return counts describing which sources contributed to each merged result."""
+
+        counts = {
+            "vector_only": 0,
+            "structured_only": 0,
+            "text_only": 0,
+            "merged": 0,
+            "unknown": 0,
+            "total": 0,
+        }
+        for entry in results:
+            counts["total"] += 1
+            sources = entry.get("sources")
+            if isinstance(sources, (list, set, tuple)):
+                normalized = {str(source).lower() for source in sources if source is not None}
+            elif sources is None:
+                normalized = set()
+            else:
+                normalized = {str(sources).lower()}
+
+            if not normalized:
+                counts["unknown"] += 1
+                continue
+
+            if len(normalized) > 1:
+                counts["merged"] += 1
+                continue
+
+            source = next(iter(normalized))
+            if source == "vector":
+                counts["vector_only"] += 1
+            elif source == "structured":
+                counts["structured_only"] += 1
+            elif source == "text":
+                counts["text_only"] += 1
+            else:
+                counts["unknown"] += 1
+        return counts
+
+    @staticmethod
+    def _score_breakdown(items: Sequence[HybridSearchItem]) -> Dict[str, Any]:
+        """Summarize winner/tie metrics for score policy diagnostics."""
+
+        winners = {"semantic": 0, "structured": 0, "unknown": 0}
+        tie_breaks = 0
+        for item in items:
+            scores = item.scores or {}
+            winner = scores.get("winner")
+            key = winner if winner in ("semantic", "structured") else "unknown"
+            winners[key] += 1
+            if scores.get("tie_breaker_applied"):
+                tie_breaks += 1
+        return {
+            "winners": winners,
+            "tie_breaker_applied": tie_breaks,
+            "evaluated": len(items),
         }

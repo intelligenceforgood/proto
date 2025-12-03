@@ -15,9 +15,9 @@ It supports:
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TypedDict
 
 import streamlit as st
 
@@ -46,6 +46,258 @@ ACCOUNT_FORMAT_OPTIONS = ["pdf", "xlsx", "csv", "json"]
 ACCOUNT_LIST_MAX_TOP_K = ui_api.SETTINGS.account_list.max_top_k or 500
 
 
+class SavedSearchDescriptor(TypedDict, total=False):
+    """Normalized metadata describing the saved search backing a request."""
+
+    id: str
+    name: str
+    owner: Optional[str]
+    tags: List[str]
+
+
+def _clean_descriptor_text(value: Any) -> Optional[str]:
+    """Return a trimmed string or ``None`` for falsy/unsupported values."""
+
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    return None
+
+
+def _normalize_descriptor_tags(values: Any) -> List[str]:
+    """Return a deduplicated list of descriptor tags."""
+
+    tags: List[str] = []
+    if isinstance(values, list):
+        for entry in values:
+            if isinstance(entry, str):
+                cleaned = entry.strip()
+                if cleaned:
+                    tags.append(cleaned)
+    elif isinstance(values, str):
+        cleaned = values.strip()
+        if cleaned:
+            tags.append(cleaned)
+    seen: set[str] = set()
+    deduped: List[str] = []
+    for tag in tags:
+        if tag in seen:
+            continue
+        seen.add(tag)
+        deduped.append(tag)
+    return deduped
+
+
+def _extract_saved_search_descriptor(source: Optional[Dict[str, Any]]) -> Optional[SavedSearchDescriptor]:
+    """Normalize descriptor fields from heterogeneous saved-search payloads."""
+
+    if not isinstance(source, dict):
+        return None
+    candidates = [source]
+    nested = source.get("saved_search")
+    if isinstance(nested, dict):
+        candidates.append(nested)
+
+    descriptor: SavedSearchDescriptor = {}
+    collected_tags: List[str] = []
+    for data in candidates:
+        identifier = _clean_descriptor_text(data.get("saved_search_id") or data.get("search_id") or data.get("id"))
+        if identifier and "id" not in descriptor:
+            descriptor["id"] = identifier
+
+        name = _clean_descriptor_text(data.get("saved_search_name") or data.get("name"))
+        if name and "name" not in descriptor:
+            descriptor["name"] = name
+
+        owner = _clean_descriptor_text(data.get("saved_search_owner") or data.get("owner"))
+        if owner and "owner" not in descriptor:
+            descriptor["owner"] = owner
+
+        collected_tags.extend(_normalize_descriptor_tags(data.get("saved_search_tags") or data.get("tags")))
+
+    if collected_tags:
+        descriptor["tags"] = _normalize_descriptor_tags(collected_tags)
+
+    if descriptor:
+        return descriptor
+    return None
+
+
+def _combine_saved_search_descriptors(
+    primary: Optional[Dict[str, Any]],
+    secondary: Optional[Dict[str, Any]],
+) -> Optional[SavedSearchDescriptor]:
+    """Merge descriptor hints, preferring the primary source when present."""
+
+    primary_descriptor = _extract_saved_search_descriptor(primary)
+    secondary_descriptor = _extract_saved_search_descriptor(secondary)
+    if not primary_descriptor and not secondary_descriptor:
+        return None
+
+    merged: SavedSearchDescriptor = {}
+    for field in ("id", "name", "owner"):
+        field_value: Optional[str] = None
+        if primary_descriptor:
+            candidate = primary_descriptor.get(field)
+            if isinstance(candidate, str) and candidate.strip():
+                field_value = candidate.strip()
+        if not field_value and secondary_descriptor:
+            candidate = secondary_descriptor.get(field)
+            if isinstance(candidate, str) and candidate.strip():
+                field_value = candidate.strip()
+        if field_value:
+            merged[field] = field_value
+
+    tags: List[str] = []
+    for candidate in (primary_descriptor, secondary_descriptor):
+        if candidate:
+            tags.extend(candidate.get("tags") or [])
+    if tags:
+        merged["tags"] = _normalize_descriptor_tags(tags)
+
+    return merged or None
+
+
+def _default_schema_version() -> Optional[str]:
+    return (
+        ui_api.SETTINGS.search.saved_search.schema_version or ui_api.SETTINGS.search.saved_search.migration_tag or None
+    )
+
+
+def _normalize_ui_saved_search_params(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    params = dict(raw or {})
+    limit = _clamp_limit(params.get("limit") or params.get("page_size") or ui_api.SETTINGS.search.default_limit)
+    params["limit"] = limit
+    params["page_size"] = params.get("page_size") or limit
+    params["vector_limit"] = params.get("vector_limit") or limit
+    params["structured_limit"] = params.get("structured_limit") or limit
+    params["offset"] = max(int(params.get("offset") or 0), 0)
+
+    classification = params.get("classification")
+    classifications = _ensure_list(params.get("classifications"))
+    if classification and classification not in classifications:
+        classifications = [classification, *[value for value in classifications if value != classification]]
+    elif classifications and not classification:
+        classification = classifications[0]
+    params["classifications"] = classifications
+    if classification:
+        params["classification"] = classification
+
+    case_id = params.get("case_id")
+    case_ids = _ensure_list(params.get("case_ids"))
+    if case_id and case_id not in case_ids:
+        case_ids = [case_id, *[value for value in case_ids if value != case_id]]
+    elif case_ids and not case_id:
+        case_id = case_ids[0]
+    params["case_ids"] = case_ids
+    if case_id:
+        params["case_id"] = case_id
+
+    params["datasets"] = _ensure_list(params.get("datasets"))
+    params["loss_buckets"] = _ensure_list(params.get("loss_buckets"))
+    params["entities"] = params.get("entities") or []
+
+    time_range = params.get("time_range")
+    if isinstance(time_range, dict) and "start" in time_range and "end" in time_range:
+        params["time_range"] = {
+            "start": time_range["start"],
+            "end": time_range["end"],
+        }
+    else:
+        params["time_range"] = None
+
+    schema_version = params.get("schema_version") or _default_schema_version()
+    if schema_version:
+        params["schema_version"] = schema_version
+    else:
+        params.pop("schema_version", None)
+    return params
+
+
+def _build_hybrid_request_from_params(
+    params: Dict[str, Any],
+    *,
+    offset: int,
+    descriptor: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    normalized = _normalize_ui_saved_search_params(params)
+    request: Dict[str, Any] = {
+        "text": normalized.get("text") or None,
+        "classifications": normalized.get("classifications"),
+        "datasets": normalized.get("datasets"),
+        "loss_buckets": normalized.get("loss_buckets"),
+        "case_ids": normalized.get("case_ids"),
+        "entities": normalized.get("entities"),
+        "time_range": normalized.get("time_range"),
+        "limit": normalized["limit"],
+        "vector_limit": normalized["vector_limit"],
+        "structured_limit": normalized["structured_limit"],
+        "offset": max(offset, 0),
+    }
+    descriptor_payload = _combine_saved_search_descriptors(descriptor, normalized)
+    if descriptor_payload:
+        if descriptor_payload.get("id"):
+            request["saved_search_id"] = descriptor_payload["id"]
+        if descriptor_payload.get("name"):
+            request["saved_search_name"] = descriptor_payload["name"]
+        if descriptor_payload.get("owner"):
+            request["saved_search_owner"] = descriptor_payload["owner"]
+        tags = descriptor_payload.get("tags") or []
+        if tags:
+            request["saved_search_tags"] = tags
+    return request
+
+
+def _create_saved_search_params(
+    *,
+    text: Optional[str],
+    classification: Optional[str],
+    case_id: Optional[str],
+    vector_limit: int,
+    structured_limit: int,
+    page_size: int,
+    datasets: List[str],
+    loss_buckets: List[str],
+    entities: List[Dict[str, str]],
+    time_range: Dict[str, str] | None,
+) -> Dict[str, Any]:
+    base = {
+        "text": text or None,
+        "classification": classification or None,
+        "case_id": case_id or None,
+        "classifications": [classification] if classification else [],
+        "case_ids": [case_id] if case_id else [],
+        "vector_limit": vector_limit,
+        "structured_limit": structured_limit,
+        "limit": page_size,
+        "page_size": page_size,
+        "offset": 0,
+        "datasets": datasets,
+        "loss_buckets": loss_buckets,
+        "entities": entities,
+        "time_range": time_range,
+        "schema_version": _default_schema_version(),
+    }
+    return _normalize_ui_saved_search_params(base)
+
+
+def _ensure_list(values: Any) -> List[str]:
+    if isinstance(values, list):
+        return [value for value in values if isinstance(value, str) and value.strip()]
+    if isinstance(values, str) and values.strip():
+        return [values.strip()]
+    return []
+
+
+def _clamp_limit(value: Any) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = ui_api.SETTINGS.search.default_limit
+    number = max(1, min(number, 100))
+    return number
+
+
 def _date_to_iso(value: date, *, use_end_of_day: bool = False) -> str:
     """Convert a naive date to an ISO-8601 string spanning the day."""
 
@@ -53,23 +305,94 @@ def _date_to_iso(value: date, *, use_end_of_day: bool = False) -> str:
     return datetime.combine(value, boundary).replace(tzinfo=timezone.utc).isoformat()
 
 
-def run_search(params: Dict[str, Any], offset: int) -> None:
+def _iso_to_date(value: str | None) -> date | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed.date()
+
+
+def _canonical_entity_filters(raw_filters: Any) -> List[Dict[str, str]]:
+    canonical: List[Dict[str, str]] = []
+    for entry in raw_filters or []:
+        if not isinstance(entry, dict):
+            continue
+        indicator_type = entry.get("type")
+        value = (entry.get("value") or "").strip()
+        match_mode = (entry.get("match_mode") or "exact").lower()
+        if not indicator_type or not value:
+            continue
+        canonical.append(
+            {
+                "type": str(indicator_type),
+                "value": value,
+                "match_mode": match_mode if match_mode in ("exact", "prefix", "contains") else "exact",
+            }
+        )
+    return canonical
+
+
+def _time_preset_dates(preset: str) -> tuple[date, date]:
+    amount = preset.strip().lower()
+    if amount.endswith("d"):
+        try:
+            days = int(amount[:-1])
+        except ValueError:
+            days = 7
+    else:
+        days = 7
+    today = date.today()
+    start = today - timedelta(days=max(days, 1))
+    return start, today
+
+
+def _build_time_range_from_state() -> Dict[str, str] | None:
+    if not st.session_state.get("search_time_filter_enabled"):
+        return None
+    start = st.session_state.get("search_time_start")
+    end = st.session_state.get("search_time_end")
+    if not start and not end:
+        return None
+    if not start:
+        start = date.today() - timedelta(days=7)
+    if not end:
+        end = date.today()
+    return {
+        "start": _date_to_iso(start, use_end_of_day=False),
+        "end": _date_to_iso(end, use_end_of_day=True),
+    }
+
+
+def _handle_time_preset_change() -> None:
+    preset = st.session_state.get("search_time_preset")
+    if not preset:
+        return
+    start, end = _time_preset_dates(str(preset))
+    st.session_state["search_time_start"] = start
+    st.session_state["search_time_end"] = end
+
+
+def run_search(
+    params: Dict[str, Any],
+    offset: int,
+    *,
+    descriptor: Optional[Dict[str, Any]] = None,
+) -> None:
+    canonical = _normalize_ui_saved_search_params(params)
+    st.session_state["search_params"] = canonical
     try:
         st.session_state["case_reviews"] = {}
-        payload = ui_api.search_cases_api(
-            text=params.get("text"),
-            classification=params.get("classification"),
-            case_id=params.get("case_id"),
-            vector_limit=params["vector_limit"],
-            structured_limit=params["structured_limit"],
-            page_size=params["page_size"],
-            offset=offset,
+        payload = ui_api.search_cases_hybrid_api(
+            _build_hybrid_request_from_params(canonical, offset=offset, descriptor=descriptor)
         )
         results = payload.get("results", [])
         st.session_state["search_results"] = results
         st.session_state["search_error"] = None
         st.session_state["search_offset"] = payload.get("offset", offset)
-        st.session_state["search_more_available"] = len(results) == params["page_size"]
+        st.session_state["search_more_available"] = len(results) == canonical["page_size"]
         st.session_state["search_meta"] = {
             "total": payload.get("total"),
             "vector_hits": payload.get("vector_hits"),
@@ -106,24 +429,67 @@ def _refresh_intakes(limit: Optional[int] = None) -> None:
         st.session_state["intake_error"] = str(exc)
 
 
-def _execute_saved_search(saved_id: str, params: Dict[str, Any]) -> None:
+def _execute_saved_search(
+    saved_id: str,
+    params: Dict[str, Any],
+    descriptor: Optional[Dict[str, Any]] = None,
+) -> None:
+    normalized = _normalize_ui_saved_search_params(params)
     st.session_state["active_saved_search_id"] = saved_id
-    st.session_state["search_text_input"] = params.get("text", "") or ""
-    st.session_state["search_class_input"] = params.get("classification", "") or ""
-    st.session_state["search_case_input"] = params.get("case_id", "") or ""
-    st.session_state["search_vector_limit_slider"] = params.get("vector_limit", 5) or 5
-    st.session_state["search_structured_limit_slider"] = params.get("structured_limit", 5) or 5
-    st.session_state["search_page_size_slider"] = params.get("page_size", 5) or 5
-    st.session_state["search_params"] = params
-    offset = params.get("offset", 0)
+    st.session_state["search_text_input"] = normalized.get("text", "") or ""
+    st.session_state["search_class_input"] = normalized.get("classification", "") or ""
+    st.session_state["search_case_input"] = normalized.get("case_id", "") or ""
+    st.session_state["search_vector_limit_slider"] = min(max(normalized.get("vector_limit", 5), 1), 20)
+    st.session_state["search_structured_limit_slider"] = min(max(normalized.get("structured_limit", 5), 1), 20)
+    st.session_state["search_page_size_slider"] = min(max(normalized.get("page_size", 5), 1), 20)
+    st.session_state["search_dataset_filters"] = list(normalized.get("datasets") or [])
+    st.session_state["search_loss_filters"] = list(normalized.get("loss_buckets") or [])
+    st.session_state["search_entity_filters"] = list(normalized.get("entities") or [])
+    time_range = normalized.get("time_range") or None
+    if time_range:
+        st.session_state["search_time_filter_enabled"] = True
+        st.session_state["search_time_start"] = (
+            _iso_to_date(time_range.get("start")) or st.session_state["search_time_start"]
+        )
+        st.session_state["search_time_end"] = _iso_to_date(time_range.get("end")) or st.session_state["search_time_end"]
+    else:
+        st.session_state["search_time_filter_enabled"] = False
+        st.session_state["search_time_preset"] = None
+    st.session_state["search_params"] = normalized
+    offset = normalized.get("offset", 0)
     st.session_state["search_offset"] = offset
-    run_search(params, offset=offset)
+    descriptor_payload = dict(descriptor or {})
+    if descriptor_payload:
+        if not descriptor_payload.get("search_id") and not descriptor_payload.get("saved_search_id"):
+            descriptor_payload["search_id"] = saved_id
+    descriptor_details = _extract_saved_search_descriptor(descriptor_payload)
+    if descriptor_details:
+        if descriptor_details.get("id"):
+            normalized["saved_search_id"] = descriptor_details["id"]
+        if descriptor_details.get("name"):
+            normalized["saved_search_name"] = descriptor_details["name"]
+        if descriptor_details.get("owner"):
+            normalized["saved_search_owner"] = descriptor_details["owner"]
+        if descriptor_details.get("tags"):
+            normalized["saved_search_tags"] = descriptor_details["tags"]
+    run_search(normalized, offset=offset, descriptor=descriptor_details)
     st.rerun()
 
 
 def _tag_badge(tag: str) -> str:
     color = TAG_PAL[hash(tag) % len(TAG_PAL)]
     return f"<span style='background:{color}; padding:2px 6px; border-radius:6px; margin-right:4px;'>{tag}</span>"
+
+
+def _ensure_search_schema(force: bool = False) -> None:
+    if not force and st.session_state.get("search_schema"):
+        return
+    try:
+        schema = ui_api.fetch_search_schema()
+        st.session_state["search_schema"] = schema
+        st.session_state["search_schema_error"] = None
+    except Exception as exc:  # pragma: no cover - interactive UI path
+        st.session_state["search_schema_error"] = str(exc)
 
 
 st.set_page_config(page_title="i4g Analyst Dashboard", page_icon=PAGE_ICON, layout="wide")
@@ -137,6 +503,7 @@ with header_cols[1]:
 
 # Sidebar controls
 ensure_session_defaults()
+_ensure_search_schema()
 
 st.sidebar.header("Connection")
 if LOGO_MARK.exists():
@@ -147,6 +514,7 @@ st.sidebar.text_input("API Key", key="api_key")
 if st.sidebar.button("Save connection"):
     st.experimental_set_query_params()  # noop to persist inputs in UI
     st.success("Connection settings updated (for this session).")
+    _ensure_search_schema(force=True)
 
 with st.sidebar.form("case_search_form"):
     st.markdown("### Search cases")
@@ -195,15 +563,157 @@ st.session_state["search_structured_limit_value"] = st.session_state["search_str
 st.session_state["search_page_size_value"] = st.session_state["search_page_size_slider"]
 st.session_state["preview_enabled"] = preview_enabled
 
+with st.sidebar.expander("Advanced filters", expanded=False):
+    schema = st.session_state.get("search_schema") or {}
+    schema_error = st.session_state.get("search_schema_error")
+    refresh_requested = st.button("Refresh schema", key="refresh_search_schema")
+    if refresh_requested:
+        _ensure_search_schema(force=True)
+        st.experimental_rerun()
+    if schema_error:
+        st.warning(f"Schema unavailable: {schema_error}")
+
+    dataset_options = schema.get("datasets", [])
+    dataset_defaults = [
+        value for value in st.session_state.get("search_dataset_filters", []) if value in dataset_options
+    ]
+    st.multiselect(
+        "Datasets",
+        options=dataset_options,
+        default=dataset_defaults,
+        help="Restrict search results to specific ingestion datasets.",
+        key="search_dataset_filters",
+    )
+
+    loss_options = schema.get("loss_buckets", [])
+    loss_defaults = [value for value in st.session_state.get("search_loss_filters", []) if value in loss_options]
+    st.multiselect(
+        "Loss buckets",
+        options=loss_options,
+        default=loss_defaults,
+        help="Filter by reported loss range when available.",
+        key="search_loss_filters",
+    )
+
+    entity_types = schema.get("indicator_types", [])
+    entity_examples = schema.get("entity_examples") or {}
+    if entity_types:
+        builder_type = st.session_state.get("entity_builder_type") or entity_types[0]
+        if builder_type not in entity_types:
+            builder_type = entity_types[0]
+            st.session_state["entity_builder_type"] = builder_type
+        type_index = entity_types.index(builder_type)
+        st.selectbox(
+            "Entity type",
+            options=entity_types,
+            index=type_index,
+            key="entity_builder_type",
+        )
+    else:
+        st.info("Entity schema not available; refresh to load indicator types.")
+
+    st.text_input("Entity value", key="entity_builder_value")
+    match_modes = ["exact", "prefix", "contains"]
+    match_mode = st.session_state.get("entity_builder_match_mode") or "exact"
+    if match_mode not in match_modes:
+        match_mode = "exact"
+        st.session_state["entity_builder_match_mode"] = match_mode
+    st.selectbox(
+        "Match mode",
+        options=match_modes,
+        index=match_modes.index(match_mode),
+        key="entity_builder_match_mode",
+    )
+    if st.button("Add entity filter", key="add_entity_filter"):
+        value = (st.session_state.get("entity_builder_value") or "").strip()
+        selected_type = st.session_state.get("entity_builder_type") or (entity_types[0] if entity_types else None)
+        if not selected_type or not value:
+            st.warning("Specify both an entity type and value before adding a filter.")
+        else:
+            filters = list(st.session_state.get("search_entity_filters") or [])
+            filters.append(
+                {
+                    "type": selected_type,
+                    "value": value,
+                    "match_mode": st.session_state.get("entity_builder_match_mode") or "exact",
+                }
+            )
+            st.session_state["search_entity_filters"] = filters
+            st.session_state["entity_builder_value"] = ""
+            st.experimental_rerun()
+
+    active_entities = st.session_state.get("search_entity_filters") or []
+    if active_entities:
+        st.caption("Active entity filters")
+        for idx, entity in enumerate(active_entities):
+            label = f"{entity.get('type')}: {entity.get('value')} ({entity.get('match_mode', 'exact')})"
+            cols = st.columns([4, 1])
+            cols[0].write(label)
+            if cols[1].button("✕", key=f"remove_entity_{idx}"):
+                updated = list(active_entities)
+                updated.pop(idx)
+                st.session_state["search_entity_filters"] = updated
+                st.experimental_rerun()
+    else:
+        st.caption("No entity filters defined.")
+
+    if entity_examples:
+        st.caption("Entity examples")
+        for indicator, samples in entity_examples.items():
+            if not samples:
+                continue
+            preview = ", ".join(samples[:3])
+            st.markdown(f"- **{indicator}**: {preview}")
+
+    time_enabled = st.checkbox("Filter by time range", key="search_time_filter_enabled")
+    if time_enabled:
+        presets = schema.get("time_presets", [])
+        preset_options = [""] + presets
+        current_preset = st.session_state.get("search_time_preset") or ""
+        if current_preset not in preset_options:
+            current_preset = ""
+            st.session_state["search_time_preset"] = current_preset
+        preset_index = preset_options.index(current_preset)
+        st.selectbox(
+            "Preset window",
+            options=preset_options,
+            index=preset_index,
+            format_func=lambda value: value or "Custom",
+            key="search_time_preset",
+            on_change=_handle_time_preset_change,
+        )
+        st.date_input(
+            "Start date",
+            value=st.session_state.get("search_time_start"),
+            key="search_time_start",
+        )
+        st.date_input(
+            "End date",
+            value=st.session_state.get("search_time_end"),
+            key="search_time_end",
+        )
+    else:
+        st.session_state["search_time_preset"] = None
+
+    if st.button("Reset advanced filters", key="reset_advanced_filters"):
+        st.session_state["search_dataset_filters"] = []
+        st.session_state["search_loss_filters"] = []
+        st.session_state["search_entity_filters"] = []
+        st.session_state["entity_builder_value"] = ""
+        st.session_state["search_time_filter_enabled"] = False
+        st.session_state["search_time_preset"] = None
+        st.experimental_rerun()
+
 if st.session_state.get("pending_saved_search_preview"):
     preview = st.session_state["pending_saved_search_preview"]
     with st.container():
-        st.info(f"Preview saved search: {preview.get('name') or preview.get('id')}")
+        label = preview.get("label") or preview.get("name") or preview.get("id")
+        st.info(f"Preview saved search: {label}")
         st.json(preview.get("params", {}))
         confirm_col, cancel_col = st.columns([1, 1])
         if confirm_col.button("Run saved search", key="confirm_saved_search_preview"):
             data = st.session_state.pop("pending_saved_search_preview")
-            _execute_saved_search(data["id"], data["params"])
+            _execute_saved_search(data["id"], data["params"], descriptor=data.get("descriptor"))
         if cancel_col.button("Cancel", key="cancel_saved_search_preview"):
             st.session_state.pop("pending_saved_search_preview", None)
             st.rerun()
@@ -211,12 +721,17 @@ if st.session_state.get("pending_saved_search_preview"):
 if st.session_state.get("pending_history_search_preview"):
     history_preview = st.session_state["pending_history_search_preview"]
     with st.container():
-        st.info(f"Preview history search: {history_preview.get('key')}")
+        label = history_preview.get("label") or history_preview.get("key")
+        st.info(f"Preview history search: {label}")
         st.json(history_preview.get("params", {}))
         confirm_hist, cancel_hist = st.columns([1, 1])
         if confirm_hist.button("Run history search", key="confirm_history_search_preview"):
             data = st.session_state.pop("pending_history_search_preview")
-            _execute_saved_search(data["key"], data["params"])
+            _execute_saved_search(
+                data.get("saved_id") or data.get("key"),
+                data["params"],
+                descriptor=data.get("descriptor"),
+            )
         if cancel_hist.button("Cancel", key="cancel_history_search_preview"):
             st.session_state.pop("pending_history_search_preview", None)
             st.rerun()
@@ -487,16 +1002,26 @@ with st.sidebar.expander("Saved searches", expanded=False):
                     st.rerun()
                 except Exception as exc:
                     st.error(f"Failed to toggle favorite: {exc}")
+            descriptor_payload: Dict[str, Any] = {"search_id": saved_id, "name": name}
+            owner_value = saved.get("owner")
+            if owner_value:
+                descriptor_payload["owner"] = owner_value
+            tag_values = saved.get("tags") or []
+            if tag_values:
+                descriptor_payload["tags"] = tag_values
+
             if col_load.button("Run", key=f"run_saved_{saved_id}"):
                 if st.session_state.get("preview_enabled", True):
                     st.session_state["pending_saved_search_preview"] = {
                         "id": saved_id,
                         "params": params,
                         "name": name,
+                        "label": name or saved_id,
+                        "descriptor": descriptor_payload,
                     }
                     st.rerun()
                 else:
-                    _execute_saved_search(saved_id, params)
+                    _execute_saved_search(saved_id, params, descriptor=descriptor_payload)
             with col_info.expander("Details / Rename", expanded=False):
                 st.json(params)
                 st.caption(f"Owner: {saved.get('owner', 'shared')} · Created {saved.get('created_at', 'unknown')}")
@@ -934,17 +1459,22 @@ else:
 
 
 if search_submitted:
-    params = {
-        "text": (search_text.strip() or None) if search_text else None,
-        "classification": ((search_classification.strip() or None) if search_classification else None),
-        "case_id": (search_case_id.strip() or None) if search_case_id else None,
-        "vector_limit": st.session_state["search_vector_limit_value"],
-        "structured_limit": st.session_state["search_structured_limit_value"],
-        "page_size": st.session_state["search_page_size_value"],
-    }
-    if update_existing and st.session_state.get("active_saved_search_id"):
-        params["search_id"] = st.session_state["active_saved_search_id"]
-    st.session_state["search_params"] = params
+    dataset_filters = list(st.session_state.get("search_dataset_filters") or [])
+    loss_filters = list(st.session_state.get("search_loss_filters") or [])
+    entity_filters = _canonical_entity_filters(st.session_state.get("search_entity_filters"))
+    time_range = _build_time_range_from_state()
+    params = _create_saved_search_params(
+        text=(search_text.strip() or None) if search_text else None,
+        classification=(search_classification.strip() or None) if search_classification else None,
+        case_id=(search_case_id.strip() or None) if search_case_id else None,
+        vector_limit=st.session_state["search_vector_limit_value"],
+        structured_limit=st.session_state["search_structured_limit_value"],
+        page_size=st.session_state["search_page_size_value"],
+        datasets=dataset_filters,
+        loss_buckets=loss_filters,
+        entities=entity_filters,
+        time_range=time_range,
+    )
     st.session_state["search_offset"] = 0
     run_search(params, offset=0)
     if save_requested and save_name.strip():
@@ -1010,7 +1540,7 @@ if search_params and page_size:
         new_offset = max(0, current_offset - page_size)
         st.session_state["search_offset"] = new_offset
         run_search(search_params, offset=new_offset)
-    st.rerun()
+        st.rerun()
 
     if nav_next.button(
         "Next ▶",
@@ -1020,7 +1550,7 @@ if search_params and page_size:
         new_offset = current_offset + page_size
         st.session_state["search_offset"] = new_offset
         run_search(search_params, offset=new_offset)
-    st.rerun()
+        st.rerun()
 
 search_results = st.session_state.get("search_results") or []
 if search_results:
@@ -1147,19 +1677,33 @@ if history_events:
     st.subheader("🕘 Recent search history")
     for event in history_events:
         payload = event.get("payload", {})
+        request_snapshot = payload.get("request") if isinstance(payload.get("request"), dict) else None
+        summary_source = request_snapshot or payload
         timestamp = event.get("created_at", "unknown time")
         actor = event.get("actor", "unknown")
-        summary = payload.get("text") or payload.get("case_id") or "(no query)"
+        summary = summary_source.get("text") or summary_source.get("case_id") or "(no query)"
         search_key = payload.get("search_id", event.get("action_id"))
-        tags = payload.get("tags") or []
-        tag_badge = "".join(f"[`{t}`]" for t in tags)
+        descriptor_payload = _combine_saved_search_descriptors(payload, request_snapshot)
+        descriptor_label = descriptor_payload.get("name") if descriptor_payload else None
+        tags = (descriptor_payload.get("tags") if descriptor_payload else None) or payload.get("tags") or []
+        metadata_parts = [f"`{search_key}`" if search_key else "(no id)", timestamp, actor]
+        if descriptor_label:
+            metadata_parts.append(f"saved: **{descriptor_label}**")
+        if summary:
+            metadata_parts.append(f"query: `{summary}`")
+        line = " · ".join(metadata_parts)
+        tag_markup = " ".join(_tag_badge(t) for t in tags)
+        if tag_markup:
+            line = f"{line} {tag_markup}"
         cols = st.columns([0.6, 0.4])
-        cols[0].markdown(
-            f"`{search_key}` · {timestamp} · {actor} · query: `{summary}` {' '.join(_tag_badge(t) for t in tags)}",
-            unsafe_allow_html=True,
-        )
+        cols[0].markdown(line, unsafe_allow_html=True)
+
+        descriptor_for_run = dict(descriptor_payload) if descriptor_payload else None
+        saved_id_for_run = descriptor_payload.get("id") if descriptor_payload else None
+        saved_id_for_run = saved_id_for_run or search_key
+
         if cols[1].button("Run", key=f"run_history_{search_key}"):
-            params = {
+            base_params = request_snapshot or {
                 "text": payload.get("text"),
                 "classification": payload.get("classification"),
                 "case_id": payload.get("case_id"),
@@ -1169,15 +1713,24 @@ if history_events:
                     st.session_state["search_structured_limit_value"],
                 ),
                 "page_size": payload.get("page_size", st.session_state["search_page_size_value"]),
+                "limit": payload.get("limit"),
+                "datasets": payload.get("datasets"),
+                "loss_buckets": payload.get("loss_buckets"),
+                "entities": payload.get("entities"),
+                "time_range": payload.get("time_range"),
             }
+            params = _normalize_ui_saved_search_params(base_params)
             if st.session_state.get("preview_enabled", True):
                 st.session_state["pending_history_search_preview"] = {
                     "key": search_key,
+                    "saved_id": saved_id_for_run,
                     "params": params,
+                    "descriptor": descriptor_for_run,
+                    "label": descriptor_label or summary or search_key,
                 }
                 st.rerun()
             else:
-                _execute_saved_search(search_key, params)
+                _execute_saved_search(saved_id_for_run or "history", params, descriptor=descriptor_for_run)
 
 queue = []
 try:
