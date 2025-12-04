@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterator, List, Literal, Sequence
 
 import sqlalchemy as sa
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
 from i4g.store import sql as sql_schema
@@ -136,20 +137,29 @@ class EntityStore:
 
         normalized_types = _normalize_list(entity_types)
         with self._session_scope() as session:
-            stmt = (
-                sa.select(
-                    sa.func.lower(sql_schema.cases.c.dataset).label("dataset_key"),
-                    sql_schema.cases.c.dataset,
-                    sa.func.count().label("row_count"),
+            try:
+                stmt = (
+                    sa.select(
+                        sa.func.lower(sql_schema.cases.c.dataset).label("dataset_key"),
+                        sql_schema.cases.c.dataset,
+                        sa.func.count().label("row_count"),
+                    )
+                    .join(sql_schema.entities, sql_schema.entities.c.case_id == sql_schema.cases.c.case_id)
+                    .where(sql_schema.cases.c.dataset.is_not(None))
                 )
-                .join(sql_schema.entities, sql_schema.entities.c.case_id == sql_schema.cases.c.case_id)
-                .where(sql_schema.cases.c.dataset.is_not(None))
-            )
-            if normalized_types:
-                stmt = stmt.where(sa.func.lower(sql_schema.entities.c.entity_type).in_(normalized_types))
-            stmt = stmt.group_by(sql_schema.cases.c.dataset)
-            stmt = stmt.order_by(sa.func.count().desc(), sql_schema.cases.c.dataset.asc())
-            rows = session.execute(stmt).all()
+                if normalized_types:
+                    stmt = stmt.where(sa.func.lower(sql_schema.entities.c.entity_type).in_(normalized_types))
+                stmt = stmt.group_by(sql_schema.cases.c.dataset)
+                stmt = stmt.order_by(sa.func.count().desc(), sql_schema.cases.c.dataset.asc())
+                rows = session.execute(stmt).all()
+            except OperationalError as exc:
+                if _is_missing_table_error(exc):
+                    LOGGER.warning(
+                        "Structured store tables are missing; returning an empty dataset list",
+                        exc_info=False,
+                    )
+                    return []
+                raise
 
         datasets: Dict[str, str] = {}
         for row in rows:
@@ -181,45 +191,54 @@ class EntityStore:
         results: Dict[str, List[Dict[str, Any]]] = {entity_type: [] for entity_type in normalized_types}
 
         with self._session_scope() as session:
-            for entity_type in normalized_types:
-                stmt = (
-                    sa.select(
-                        sql_schema.entities.c.canonical_value,
-                        sql_schema.entities.c.metadata.label("entity_metadata"),
-                        sql_schema.entities.c.last_seen_at,
-                        sql_schema.cases.c.dataset,
+            try:
+                for entity_type in normalized_types:
+                    stmt = (
+                        sa.select(
+                            sql_schema.entities.c.canonical_value,
+                            sql_schema.entities.c.metadata.label("entity_metadata"),
+                            sql_schema.entities.c.last_seen_at,
+                            sql_schema.cases.c.dataset,
+                        )
+                        .join(sql_schema.cases, sql_schema.cases.c.case_id == sql_schema.entities.c.case_id)
+                        .where(sa.func.lower(sql_schema.entities.c.entity_type) == entity_type)
                     )
-                    .join(sql_schema.cases, sql_schema.cases.c.case_id == sql_schema.entities.c.case_id)
-                    .where(sa.func.lower(sql_schema.entities.c.entity_type) == entity_type)
-                )
-                if dataset_filters:
-                    stmt = stmt.where(sa.func.lower(sql_schema.cases.c.dataset).in_(dataset_filters))
-                stmt = stmt.order_by(sql_schema.entities.c.last_seen_at.desc().nullslast())
-                stmt = stmt.limit(fetch_limit)
-                rows = session.execute(stmt).all()
+                    if dataset_filters:
+                        stmt = stmt.where(sa.func.lower(sql_schema.cases.c.dataset).in_(dataset_filters))
+                    stmt = stmt.order_by(sql_schema.entities.c.last_seen_at.desc().nullslast())
+                    stmt = stmt.limit(fetch_limit)
+                    rows = session.execute(stmt).all()
 
-                examples: List[Dict[str, Any]] = []
-                seen_values: set[str] = set()
-                for row in rows:
-                    canonical = (row.canonical_value or "").strip()
-                    if not canonical:
-                        continue
-                    key = canonical.lower()
-                    if key in seen_values:
-                        continue
-                    seen_values.add(key)
-                    entity_metadata = _coerce_metadata(row.entity_metadata)
-                    dataset = row.dataset or entity_metadata.get("dataset")
-                    examples.append(
-                        {
-                            "value": canonical,
-                            "dataset": dataset,
-                            "last_seen_at": _serialize_timestamp(row.last_seen_at),
-                        }
+                    examples: List[Dict[str, Any]] = []
+                    seen_values: set[str] = set()
+                    for row in rows:
+                        canonical = (row.canonical_value or "").strip()
+                        if not canonical:
+                            continue
+                        key = canonical.lower()
+                        if key in seen_values:
+                            continue
+                        seen_values.add(key)
+                        entity_metadata = _coerce_metadata(row.entity_metadata)
+                        dataset = row.dataset or entity_metadata.get("dataset")
+                        examples.append(
+                            {
+                                "value": canonical,
+                                "dataset": dataset,
+                                "last_seen_at": _serialize_timestamp(row.last_seen_at),
+                            }
+                        )
+                        if len(examples) >= per_type_limit:
+                            break
+                    results[entity_type] = examples
+            except OperationalError as exc:
+                if _is_missing_table_error(exc):
+                    LOGGER.warning(
+                        "Structured store tables are missing; returning empty entity example list",
+                        exc_info=False,
                     )
-                    if len(examples) >= per_type_limit:
-                        break
-                results[entity_type] = examples
+                    return {}
+                raise
 
         return results
 
@@ -357,6 +376,17 @@ def _serialize_timestamp(value: Any) -> str | None:
     if isinstance(value, str):
         return value
     return str(value)
+
+
+def _is_missing_table_error(error: OperationalError) -> bool:
+    """Return True when the SQL backend reports a missing-table error."""
+
+    message = str(error).lower()
+    if "no such table" in message:
+        return True
+    if "does not exist" in message:
+        return True
+    return False
 
 
 __all__ = ["EntityStore", "MatchMode"]

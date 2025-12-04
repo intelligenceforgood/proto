@@ -7,8 +7,10 @@ import json
 import os
 import subprocess
 import sys
+import uuid
 import warnings
 from collections.abc import Sequence as AbcSequence
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -16,8 +18,22 @@ from google.cloud import discoveryengine_v1beta as discoveryengine
 from google.protobuf import json_format
 from rich.console import Console
 
-from i4g.services.factories import build_review_store, build_vector_store
+from i4g.reports.bundle_builder import BundleCriteria
+from i4g.reports.dossier_pilot import (
+    DEFAULT_PILOT_CASES_PATH,
+    load_pilot_case_specs,
+    schedule_pilot_plans,
+    seed_pilot_cases,
+)
+from i4g.reports.dossier_queue_processor import DossierQueueProcessor
+from i4g.services.factories import (
+    build_bundle_builder,
+    build_bundle_candidate_provider,
+    build_review_store,
+    build_vector_store,
+)
 from i4g.settings import get_settings
+from i4g.task_status import TaskStatusReporter
 
 # Fix for OpenMP runtime conflict on macOS.
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -328,6 +344,163 @@ def bulk_update_saved_search_tags(args: argparse.Namespace) -> None:
     console.print(f"[green]✅ Updated tags for {updated} saved search(es).")
 
 
+def build_dossiers(args: argparse.Namespace) -> None:
+    provider = build_bundle_candidate_provider()
+    candidates = provider.list_candidates(limit=args.limit)
+    if not candidates:
+        console.print(
+            f"[yellow]No accepted cases found for bundling (limit={args.limit}). "
+            "Review queue state before rerunning."
+        )
+        return
+
+    min_loss_value = (
+        Decimal(str(args.min_loss)) if args.min_loss is not None else Decimal(str(SETTINGS.report.min_loss_usd))
+    )
+    criteria = BundleCriteria(
+        min_loss_usd=min_loss_value,
+        recency_days=args.recency_days or SETTINGS.report.recency_days,
+        max_cases_per_dossier=args.max_cases or SETTINGS.report.max_cases_per_dossier,
+        jurisdiction_mode=args.jurisdiction_mode,
+        require_cross_border=args.cross_border_only or SETTINGS.report.require_cross_border,
+    )
+
+    builder = build_bundle_builder()
+    if args.dry_run:
+        plans = builder.generate_plans(candidates=candidates, criteria=criteria)
+        console.print(f"[cyan]ℹ️ Dry run:[/cyan] {len(plans)} dossier plan(s) would be created.")
+        preview = min(args.preview, len(plans))
+        for plan in plans[:preview]:
+            console.print(
+                "  - "
+                f"{plan.plan_id} | cases={len(plan.cases)} | loss=${plan.total_loss_usd} | "
+                f"jurisdiction={plan.jurisdiction_key} | cross_border={plan.cross_border}"
+            )
+        if len(plans) > preview:
+            console.print(f"  ...and {len(plans) - preview} more plan(s).")
+        return
+
+    plan_ids = builder.build_and_enqueue(candidates=candidates, criteria=criteria)
+    console.print(f"[green]✅ Enqueued {len(plan_ids)} dossier plan(s) for agent processing.")
+
+
+def process_dossiers(args: argparse.Namespace) -> None:
+    processor = DossierQueueProcessor()
+    task_id = args.task_id or os.getenv("I4G_TASK_ID")
+    endpoint = args.task_status_url or os.getenv("I4G_TASK_STATUS_URL")
+    if not task_id and endpoint:
+        task_id = f"dossier-cli-{uuid.uuid4()}"
+
+    reporter = TaskStatusReporter(task_id=task_id, endpoint=endpoint)
+    if reporter.is_enabled():
+        reporter.update(status="started", message="CLI dossier processing started", batch_size=args.batch_size)
+
+    summary = processor.process_batch(
+        batch_size=args.batch_size,
+        dry_run=args.dry_run,
+        reporter=reporter if reporter.is_enabled() else None,
+    )
+    if summary.processed == 0:
+        console.print("[yellow]No pending dossier plans found in the queue.[/yellow]")
+        return
+
+    console.print(
+        "[green]✅ Processed {processed} plan(s) — completed={completed} failed={failed} dry_run={dry}[/green]".format(
+            processed=summary.processed,
+            completed=summary.completed,
+            failed=summary.failed,
+            dry="yes" if summary.dry_run else "no",
+        )
+    )
+
+    preview = min(args.preview, len(summary.plans))
+    for plan in summary.plans[:preview]:
+        status = plan.get("status")
+        plan_id = plan.get("plan_id")
+        artifacts = plan.get("artifacts") or []
+        console.print(f"  - {plan_id} [{status}]")
+        if artifacts:
+            console.print(f"      artifacts: {artifacts}")
+        if plan.get("warnings"):
+            console.print(f"      warnings: {plan['warnings']}")
+        if plan.get("error"):
+            console.print(f"      error: {plan['error']}")
+
+
+def schedule_pilot_dossiers(args: argparse.Namespace) -> None:
+    cases_path = Path(args.cases_file).expanduser()
+    try:
+        specs = list(load_pilot_case_specs(cases_path))
+    except Exception as exc:  # pragma: no cover - file IO errors surface here
+        console.print(f"[red]❌ Failed to load pilot cases:[/red] {exc}")
+        sys.exit(1)
+
+    requested_ids = set()
+    if args.cases:
+        for raw in args.cases:
+            for part in str(raw).split(","):
+                value = part.strip()
+                if value:
+                    requested_ids.add(value)
+    missing_from_config: list[str] = []
+    if requested_ids:
+        specs = [spec for spec in specs if spec.case_id in requested_ids]
+        missing_from_config = sorted(requested_ids - {spec.case_id for spec in specs})
+
+    if args.case_count:
+        specs = specs[: args.case_count]
+
+    if not specs:
+        console.print("[red]❌ No pilot cases matched the provided filters.")
+        sys.exit(1)
+
+    seed_summary = seed_pilot_cases(specs)
+    console.print(
+        f"[green]✅ Seeded {len(seed_summary.case_ids)} pilot case(s) into structured + review stores.[/green]"
+    )
+
+    if missing_from_config:
+        console.print(
+            "[yellow]⚠️ The following case_id(s) were not present in the pilot config:[/yellow] "
+            + ", ".join(missing_from_config)
+        )
+
+    if args.seed_only:
+        console.print("[cyan]ℹ️ Seed-only mode enabled; skipping dossier plan generation.")
+        return
+
+    min_loss = Decimal(str(args.min_loss)) if args.min_loss is not None else Decimal(str(SETTINGS.report.min_loss_usd))
+    criteria = BundleCriteria(
+        min_loss_usd=min_loss,
+        recency_days=args.recency_days or SETTINGS.report.recency_days,
+        max_cases_per_dossier=args.max_cases or SETTINGS.report.max_cases_per_dossier,
+        jurisdiction_mode=args.jurisdiction_mode,
+        require_cross_border=args.cross_border_only or SETTINGS.report.require_cross_border,
+    )
+
+    schedule_summary = schedule_pilot_plans(specs, criteria=criteria, dry_run=args.dry_run)
+
+    if schedule_summary.missing_cases:
+        console.print(
+            "[yellow]⚠️ Candidate provider missing case_id(s):[/yellow] " + ", ".join(schedule_summary.missing_cases)
+        )
+
+    if not schedule_summary.plan_ids:
+        console.print("[yellow]No dossier plans matched the pilot selection after filtering.")
+        return
+
+    if schedule_summary.dry_run:
+        console.print(
+            f"[cyan]ℹ️ Dry run: {len(schedule_summary.plan_ids)} plan(s) would be generated: "
+            + ", ".join(schedule_summary.plan_ids)
+        )
+    else:
+        console.print(
+            f"[green]✅ Enqueued {len(schedule_summary.plan_ids)} pilot plan(s): "
+            + ", ".join(schedule_summary.plan_ids)
+        )
+
+
 def export_tag_presets(args: argparse.Namespace) -> None:
     store = build_review_store()
     presets = store.list_tag_presets(owner=args.owner, limit=1000)
@@ -523,6 +696,139 @@ def build_parser() -> argparse.ArgumentParser:
     import_tags = sub.add_parser("import-tag-presets", help="Import tag presets and append as filter presets.")
     import_tags.add_argument("--input", help="JSON file path (defaults to stdin).")
     import_tags.set_defaults(func=import_tag_presets)
+
+    bundle = sub.add_parser(
+        "build-dossiers",
+        aliases=["bundle-dossiers"],
+        help="Group accepted cases into dossier queue entries.",
+    )
+    bundle.add_argument("--limit", type=int, default=200, help="Number of accepted cases to inspect (default: 200).")
+    bundle.add_argument(
+        "--min-loss",
+        type=float,
+        default=None,
+        help="Minimum loss threshold in USD (overrides settings.report.min_loss_usd).",
+    )
+    bundle.add_argument(
+        "--recency-days",
+        type=int,
+        default=None,
+        help="Accepted-within window in days (defaults to settings.report.recency_days).",
+    )
+    bundle.add_argument(
+        "--max-cases",
+        type=int,
+        default=None,
+        help="Maximum number of cases per dossier (defaults to settings.report.max_cases_per_dossier).",
+    )
+    bundle.add_argument(
+        "--jurisdiction-mode",
+        choices=["single", "multi", "global"],
+        default="single",
+        help="Grouping strategy for jurisdictions (default: single).",
+    )
+    bundle.add_argument(
+        "--cross-border-only",
+        action="store_true",
+        help="Require cross-border cases regardless of settings.report.require_cross_border.",
+    )
+    bundle.add_argument("--dry-run", action="store_true", help="Show bundles without enqueuing them.")
+    bundle.add_argument(
+        "--preview",
+        type=int,
+        default=5,
+        help="How many plans to display during --dry-run (default: 5).",
+    )
+    bundle.set_defaults(func=build_dossiers)
+
+    process = sub.add_parser("process-dossiers", help="Lease queued dossier plans and render artifacts.")
+    process.add_argument(
+        "--batch-size",
+        type=int,
+        default=5,
+        help="Number of queue entries to lease this run (default: 5).",
+    )
+    process.add_argument(
+        "--preview",
+        type=int,
+        default=5,
+        help="How many plan results to display after processing (default: 5).",
+    )
+    process.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Inspect queue entries without generating artifacts.",
+    )
+    process.add_argument(
+        "--task-id",
+        help="Optional task identifier for Task_STATUS updates (overrides I4G_TASK_ID).",
+    )
+    process.add_argument(
+        "--task-status-url",
+        help="FastAPI /tasks base URL for status updates (overrides I4G_TASK_STATUS_URL).",
+    )
+    process.set_defaults(func=process_dossiers)
+
+    pilot = sub.add_parser(
+        "pilot-dossiers",
+        help="Seed curated pilot cases and enqueue dossier plans for validation runs.",
+    )
+    pilot.add_argument(
+        "--cases-file",
+        default=str(DEFAULT_PILOT_CASES_PATH),
+        help="Path to JSON file containing pilot case specs (default: data/manual_demo/dossier_pilot_cases.json).",
+    )
+    pilot.add_argument(
+        "--case",
+        dest="cases",
+        action="append",
+        help="Specific case_id(s) to include (repeat flag or provide comma-separated list).",
+    )
+    pilot.add_argument(
+        "--case-count",
+        type=int,
+        help="Limit the number of pilot cases after filtering (default: all).",
+    )
+    pilot.add_argument(
+        "--seed-only",
+        action="store_true",
+        help="Seed pilot data without generating or enqueuing dossier plans.",
+    )
+    pilot.add_argument(
+        "--min-loss",
+        type=float,
+        default=None,
+        help="Minimum loss threshold in USD (overrides settings.report.min_loss_usd).",
+    )
+    pilot.add_argument(
+        "--recency-days",
+        type=int,
+        default=None,
+        help="Accepted-within window in days (defaults to settings.report.recency_days).",
+    )
+    pilot.add_argument(
+        "--max-cases",
+        type=int,
+        default=None,
+        help="Maximum number of cases per dossier (defaults to settings.report.max_cases_per_dossier).",
+    )
+    pilot.add_argument(
+        "--jurisdiction-mode",
+        choices=["single", "multi", "global"],
+        default="single",
+        help="Grouping strategy for jurisdictions (default: single).",
+    )
+    pilot.add_argument(
+        "--cross-border-only",
+        action="store_true",
+        help="Require cross-border cases regardless of settings.report.require_cross_border.",
+    )
+    pilot.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview plan IDs without enqueuing pilot dossiers.",
+    )
+    pilot.set_defaults(func=schedule_pilot_dossiers)
 
     return parser
 

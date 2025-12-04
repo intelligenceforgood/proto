@@ -143,6 +143,14 @@ def test_list_datasets_orders_by_frequency():
     assert set(datasets) == {"network_smoke", "retrieval_poc_dev"}
 
 
+def test_list_datasets_gracefully_handles_missing_tables():
+    engine = sa.create_engine("sqlite:///:memory:", future=True)
+    factory = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+    store = EntityStore(session_factory=factory)
+
+    assert store.list_datasets() == []
+
+
 def test_list_entity_examples_returns_unique_values():
     factory = _session_factory()
     store = EntityStore(session_factory=factory)
@@ -201,3 +209,11 @@ def test_list_entity_examples_filters_by_dataset():
 
     values = [entry["value"] for entry in filtered["ip_address"]]
     assert values == ["1.1.1.1"]
+
+
+def test_list_entity_examples_handles_missing_tables():
+    engine = sa.create_engine("sqlite:///:memory:", future=True)
+    factory = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+    store = EntityStore(session_factory=factory)
+
+    assert store.list_entity_examples(entity_types=["bank_account"], per_type_limit=3) == {}

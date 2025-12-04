@@ -77,6 +77,12 @@ def test_firestore_writer_persists_case_documents_and_entities():
         classification="investment",
         confidence=0.87,
         text="wallet verification",
+        metadata={
+            "loss_amount_usd": 125000,
+            "jurisdiction": "US-CA",
+            "victim_country": "US",
+            "scammer_country": "CN",
+        },
     )
     doc_payload = SourceDocumentPayload(
         alias="primary", title="alert", text="wallet verification", metadata={"foo": "bar"}
@@ -104,6 +110,8 @@ def test_firestore_writer_persists_case_documents_and_entities():
     case_doc = ops["cases/case-1"]
     assert case_doc["ingestion_run_id"] == "run-1"
     assert case_doc["document_ids"] == ["doc-1"]
+    assert case_doc["bundle_metrics"]["loss_band"] == "100k-250k"
+    assert case_doc["bundle_metrics"]["cross_border"] is True
 
     entity_doc = ops["cases/case-1/entities/ent-1"]
     assert entity_doc["mentions"][0]["document_id"] == "doc-1"

@@ -70,6 +70,7 @@ i4g-report-job = "i4g.worker.jobs.report:main"
 i4g-intake-job = "i4g.worker.jobs.intake:main"
 i4g-account-job = "i4g.worker.jobs.account_list:main"
 i4g-ingest-retry-job = "i4g.worker.jobs.ingest_retry:main"
+i4g-dossier-job = "i4g.worker.jobs.dossier_queue:main"
 
 [tool.hatch.version]
 path = "VERSION.txt"

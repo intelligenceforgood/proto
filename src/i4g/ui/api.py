@@ -162,6 +162,20 @@ def run_account_list_extraction(payload: Dict[str, Any]) -> Dict[str, Any]:
     return response.json()
 
 
+def fetch_dossiers(status: str = "completed", limit: int = 20, include_manifest: bool = False) -> Dict[str, Any]:
+    """Retrieve dossier queue entries from the reports API."""
+
+    client = api_client()
+    params = {
+        "status": status,
+        "limit": max(1, min(int(limit), 200)),
+        "include_manifest": include_manifest,
+    }
+    response = client.get("/reports/dossiers", params=params)
+    response.raise_for_status()
+    return response.json()
+
+
 def fetch_queue(status: str = "queued", limit: int = 50) -> List[Dict[str, Any]]:
     client = reviews_client()
     response = client.get("/queue", params={"status": status, "limit": limit})
@@ -399,6 +413,7 @@ __all__ = [
     "perform_vertex_search",
     "api_client",
     "reviews_client",
+    "fetch_dossiers",
     "fetch_queue",
     "fetch_review",
     "post_action",

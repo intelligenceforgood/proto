@@ -196,8 +196,13 @@ python -c "from i4g.settings import get_settings; print(get_settings())"
 | `settings.llm` | Chat/RAG model provider selection | `I4G_LLM__PROVIDER`, `I4G_LLM__OLLAMA_BASE_URL`, `I4G_LLM__VERTEX_AI__MODEL` |
 | `settings.identity` | Auth provider wiring for Streamlit + APIs | `I4G_IDENTITY__PROVIDER`, `I4G_IDENTITY__AUDIENCE` |
 | `settings.ingestion` | Scheduler + Cloud Run job defaults | `I4G_INGESTION__ENABLE_SCHEDULED_JOBS`, `I4G_INGESTION__SERVICE_ACCOUNT` |
+| `settings.report` | Dossier/report thresholds + Google Drive uploads | `I4G_REPORT__DRIVE_PARENT_ID`, `I4G_REPORT__MIN_LOSS_USD`, `I4G_REPORT__RECENCY_DAYS` |
 
 Use double underscores to drill into nested fields (for example `I4G_STORAGE__EVIDENCE_BUCKET=i4g-evidence-staging`). Legacy aliases like `I4G_API_URL` and `I4G_VECTOR_BACKEND` still work, so existing `.env` files do not need to change immediately.
+
+Set `I4G_REPORT__DRIVE_PARENT_ID` to the Shared Drive folder that should receive dossier exports. The CLI/worker paths
+inherit that value automatically, so the only remaining setup is granting the runtime service account Drive API access to
+that shared folder.
 
 
 ## Running the Core Pipelines
@@ -382,6 +387,88 @@ Generated `.docx` files are written to `data/reports/` whether you trigger them 
 
 ---
 
+## Dossier Bundling Workflow (Milestone 4)
+
+Use the new CLI + worker helpers when testing the agentic dossier pipeline locally:
+
+1. **Build bundle plans** (loss/recency filters + shared entities) without mutating queue state:
+
+    ```bash
+    i4g-admin build-dossiers --dry-run --limit 100 --preview 5
+    ```
+
+    Omit `--dry-run` to enqueue `DossierPlan` records inside the SQLite queue. Override thresholds with
+    `--min-loss`, `--recency-days`, `--max-cases`, and `--jurisdiction-mode` as needed.
+
+2. **Seed curated pilot runs** whenever you need deterministic demo dossiers:
+
+    ```bash
+    i4g-admin pilot-dossiers --case-count 3 --dry-run
+    i4g-admin pilot-dossiers --seed-only  # only write structured + review rows
+    ```
+
+    The command loads `data/manual_demo/dossier_pilot_cases.json` by default, seeds the structured/review stores,
+    and optionally enqueues the curated plans (or just previews them with `--dry-run`). Use `--case <id>` to target
+    specific entries or `--cases-file` to point at a different JSON payload.
+
+3. **Process queued plans** either manually or from Cloud Run:
+
+    ```bash
+    i4g-admin process-dossiers --batch-size 3 --preview 3
+    python -m i4g.worker.jobs.dossier_queue  # Cloud Run job entry point
+    ```
+
+    The processor leases queue entries, renders placeholder manifests (JSON stubs today), and marks
+    completion/failure accordingly. Pass `--dry-run` (or `I4G_DOSSIER__DRY_RUN=true`) to inspect queue
+    contents without generating artifacts; the job automatically resets the lease to `pending` after the dry run.
+
+### Relevant Environment Variables
+
+| Variable | Description |
+| --- | --- |
+| `I4G_REPORT__DRIVE_PARENT_ID` | Shared Drive folder that will receive dossier artifacts (share it with the runtime service account). |
+| `I4G_REPORT__MIN_LOSS_USD` | Minimum loss threshold applied by `BundleBuilder`/CLI before cases enter a dossier plan. |
+| `I4G_REPORT__RECENCY_DAYS` | Rolling acceptance window enforced while selecting pilot/production dossier cases. |
+| `I4G_REPORT__MAX_CASES_PER_DOSSIER` | Hard limit on cases grouped into a single dossier (default `5`). |
+| `I4G_REPORT__REQUIRE_CROSS_BORDER` | Forces dossier plans to include only cross-border cases when set to `true`. |
+| `I4G_REPORT__HASH_ALGORITHM` | Hashing algorithm for `.signatures.json` manifests (defaults to `sha256`). |
+| `I4G_DOSSIER__BATCH_SIZE` | Number of queue entries the worker processes per invocation (default `5`). |
+| `I4G_DOSSIER__DRY_RUN` | When `true`, the worker inspects queue entries without generating artifacts. |
+| `GOOGLE_APPLICATION_CREDENTIALS` | Local-only: path to a JSON service-account key that has Drive API scopes for uploads. |
+
+Grant the Cloud Run runtime account (and any local service account key) `roles/drive.file` + `.roles/drive.metadata.readonly`,
+then share the `I4G_REPORT__DRIVE_PARENT_ID` folder with that identity so uploads can succeed during dossier generation.
+
+Set these in `.env.local`, TOML configs, or Cloud Run job definitions so both the CLI and worker entrypoint share the same behavior.
+
+### Streamlit dossier viewer + regression checklist
+
+Once the queue contains `completed` dossier plans, the Streamlit analyst dashboard exposes an **Evidence dossiers**
+panel that calls `/reports/dossiers` and surfaces manifest/signature metadata side-by-side. Use it to preview what LEA
+users will see before we mirror the data into the Next.js console. Recommended smoke flow:
+
+1. **Generate artifacts** – run `i4g-admin pilot-dossiers --case-count 3` (for demo data) followed by
+    `i4g-admin process-dossiers --batch-size 3` to populate `data/reports/dossiers/*.json` locally. In cloud
+    environments, kick the Cloud Run job and confirm `status=completed` rows exist in `dossier_queue`.
+2. **Boot API + UI** – `conda run -n i4g uvicorn i4g.api.app:app --reload` in one terminal and
+    `conda run -n i4g streamlit run src/i4g/ui/analyst_dashboard.py` in another. Point the sidebar connection fields
+    at the FastAPI base URL / key you just launched.
+3. **Inspect the panel** – scroll to **📁 Evidence dossiers**, choose a status filter (`completed` for happy-path), adjust
+    the row limit, and click **Refresh dossiers**. Toggle **Include manifest payloads** when you need the inline JSON preview;
+    leave it off for faster summaries.
+4. **Verify artifacts** – each expander surfaces queue warnings, manifest/signature paths, and exposes both a manifest
+    download button and a **Verify signatures** action. The verification button hashes every artifact listed in
+    `{plan_id}.signatures.json`, reports missing/mismatched entries inline, and shows a drill-down table with path/size
+    metadata for investigators.
+5. **Optional manual hash check** – for double-blind validation, copy the SHA + path from the signature manifest, then run
+    `shasum -a 256 <path>` (or `python -m hashlib`) to confirm the command-line result matches the Streamlit verification
+    output.
+
+Record the outcomes (especially any warnings/errors) as part of the Milestone 4 regression log so we maintain a reproducible
+manual test until the automated LEA portal ships.
+
+---
+
 ## Developer Utilities
 
 **Core Scripts**
@@ -542,6 +629,13 @@ docker buildx build \
     --platform linux/amd64 \
         -f docker/report-job.Dockerfile \
         -t us-central1-docker.pkg.dev/i4g-dev/applications/report-job:dev \
+    --push \
+    .
+
+docker buildx build \
+    --platform linux/amd64 \
+        -f docker/dossier-job.Dockerfile \
+        -t us-central1-docker.pkg.dev/i4g-dev/applications/dossier-job:dev \
     --push \
     .
 ```

@@ -90,6 +90,11 @@ def ensure_session_defaults() -> None:
         "account_list_include_sources": True,
         "account_list_last_result": None,
         "account_list_error": None,
+        "dossier_items": [],
+        "dossier_error": None,
+        "dossier_status_filter": "completed",
+        "dossier_limit": 20,
+        "dossier_include_manifest": False,
     }
 
     for key, value in defaults.items():

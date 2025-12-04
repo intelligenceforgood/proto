@@ -7,8 +7,11 @@ action logging behaviors.
 """
 
 import sqlite3
+from datetime import datetime, timezone
 
 from i4g.store.review_store import ReviewStore
+from i4g.store.schema import ScamRecord
+from i4g.store.structured import StructuredStore
 
 
 def test_table_initialization(tmp_path):
@@ -92,6 +95,43 @@ def test_queue_and_actions_integration(tmp_path):
     assert actions[0]["review_id"] == review_id
 
 
+def test_upsert_queue_entry_sets_custom_timestamps(tmp_path):
+    db_path = tmp_path / "pilot_queue.db"
+    store = ReviewStore(str(db_path))
+    accepted_at = datetime(2025, 12, 1, 8, 30, tzinfo=timezone.utc)
+
+    review_id = store.upsert_queue_entry(
+        review_id="pilot-review-1",
+        case_id="case-seeded-1",
+        status="accepted",
+        queued_at=accepted_at,
+        last_updated=accepted_at,
+        priority="pilot",
+        notes="pilot seed",
+    )
+
+    entry = store.get_review(review_id)
+    assert entry is not None
+    assert entry["status"] == "accepted"
+    assert entry["priority"] == "pilot"
+    assert entry["queued_at"].startswith("2025-12-01")
+
+    updated_time = accepted_at.replace(hour=10, minute=45)
+    store.upsert_queue_entry(
+        review_id=review_id,
+        case_id="case-seeded-1",
+        status="completed",
+        queued_at=accepted_at,
+        last_updated=updated_time,
+        priority="pilot",
+        notes="pilot update",
+    )
+
+    refreshed = store.get_review(review_id)
+    assert refreshed["status"] == "completed"
+    assert refreshed["last_updated"].startswith("2025-12-01T10:45:00")
+
+
 def test_bulk_update_tags_add_remove(tmp_path):
     """Bulk add/remove tags across multiple saved searches."""
     db_path = tmp_path / "bulk_tags.db"
@@ -136,3 +176,37 @@ def test_bulk_update_tags_replace(tmp_path):
 
     record = store.get_saved_search(sid)
     assert record["tags"] == ["primary"]
+
+
+def test_list_dossier_candidates_returns_metrics(tmp_path):
+    db_path = tmp_path / "dossier_metrics.db"
+    store = ReviewStore(str(db_path))
+    structured = StructuredStore(db_path=db_path)
+    record = ScamRecord(
+        case_id="case-view",
+        text="",
+        entities={},
+        classification="investment",
+        confidence=0.9,
+        metadata={
+            "loss_amount_usd": 150000,
+            "jurisdiction": "US-CA",
+            "victim_country": "US",
+            "scammer_country": "RU",
+        },
+        created_at=datetime(2025, 12, 1, tzinfo=timezone.utc),
+    )
+    structured.upsert_record(record)
+
+    review_id = store.enqueue_case("case-view")
+    store.update_status(review_id, status="accepted")
+
+    rows = store.list_dossier_candidates()
+    structured.close()
+
+    assert len(rows) == 1
+    entry = rows[0]
+    assert entry["case_id"] == "case-view"
+    assert entry["loss_band"] == "100k-250k"
+    assert entry["geo_bucket"] == "US"
+    assert entry["cross_border"] == 1

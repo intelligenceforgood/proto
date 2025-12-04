@@ -14,7 +14,28 @@ from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, Settings
 
 ENV_VAR_NAME = "I4G_ENV"
 DEFAULT_ENV = "local"
-PROJECT_ROOT = Path(__file__).resolve().parents[4]
+
+
+def _detect_project_root() -> Path:
+    """Return the repository root, honoring ``I4G_PROJECT_ROOT`` when set."""
+
+    env_override = os.getenv("I4G_PROJECT_ROOT")
+    if env_override:
+        candidate = Path(env_override).expanduser()
+        if not candidate.is_absolute():
+            candidate = candidate.resolve()
+        return candidate
+
+    resolved = Path(__file__).resolve()
+    for parent in resolved.parents:
+        marker = parent / "pyproject.toml"
+        if marker.exists() and (parent / "src").exists():
+            return parent
+    # Fallback to the historical layout (proto/src/i4g/settings/.. => repo root at parents[3]).
+    return resolved.parents[3]
+
+
+PROJECT_ROOT = _detect_project_root()
 CONFIG_DIR = PROJECT_ROOT / "config"
 DEFAULT_CONFIG_FILE = CONFIG_DIR / "settings.default.toml"
 LOCAL_CONFIG_FILE = CONFIG_DIR / "settings.local.toml"
@@ -643,6 +664,37 @@ class SearchSettings(BaseSettings):
         return self
 
 
+class ReportSettings(BaseSettings):
+    """Agentic dossier/report configuration."""
+
+    model_config = SettingsConfigDict(extra="ignore", populate_by_name=True)
+
+    drive_parent_id: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("REPORT_DRIVE_PARENT_ID", "REPORT__DRIVE_PARENT_ID"),
+    )
+    min_loss_usd: float = Field(
+        default=50000.0,
+        validation_alias=AliasChoices("REPORT_MIN_LOSS_USD", "REPORT__MIN_LOSS_USD"),
+    )
+    recency_days: int = Field(
+        default=30,
+        validation_alias=AliasChoices("REPORT_RECENCY_DAYS", "REPORT__RECENCY_DAYS"),
+    )
+    max_cases_per_dossier: int = Field(
+        default=5,
+        validation_alias=AliasChoices("REPORT_MAX_CASES_PER_DOSSIER", "REPORT__MAX_CASES_PER_DOSSIER"),
+    )
+    require_cross_border: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("REPORT_REQUIRE_CROSS_BORDER", "REPORT__REQUIRE_CROSS_BORDER"),
+    )
+    hash_algorithm: str = Field(
+        default="sha256",
+        validation_alias=AliasChoices("REPORT_HASH_ALGORITHM", "REPORT__HASH_ALGORITHM"),
+    )
+
+
 class Settings(BaseSettings):
     """Top-level configuration model with nested sections for each subsystem."""
 
@@ -669,6 +721,7 @@ class Settings(BaseSettings):
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
     account_list: AccountListSettings = Field(default_factory=AccountListSettings)
     search: SearchSettings = Field(default_factory=SearchSettings)
+    report: ReportSettings = Field(default_factory=ReportSettings)
     env_files: tuple[Path, ...] = Field(default_factory=tuple, exclude=True)
     config_files: tuple[Path, ...] = Field(default_factory=tuple, exclude=True)
 

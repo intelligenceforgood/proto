@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 
 from google.cloud import firestore
 
+from i4g.reports.bundle_metrics import compute_bundle_metrics
 from i4g.store.sql_writer import (
     CaseBundle,
     CasePayload,
@@ -195,6 +196,8 @@ class FirestoreWriter:
             "updated_at": timestamp,
             "created_at": timestamp,
         }
+        metrics = compute_bundle_metrics(payload.metadata)
+        data["bundle_metrics"] = metrics.to_dict()
         return _strip_none(data)
 
     def _build_document_payload(

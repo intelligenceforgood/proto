@@ -22,8 +22,6 @@ from typing import Any, Dict, List, Optional, TypedDict
 import streamlit as st
 
 import i4g.ui.api as ui_api
-from i4g.ui.state import ensure_session_defaults
-from i4g.ui.views import render_discovery_engine_panel
 
 # Configuration
 BRAND_DIR = Path(__file__).parent / "assets" / "branding"
@@ -44,6 +42,9 @@ TAG_PAL = [
 ACCOUNT_CATEGORY_OPTIONS = ["bank", "crypto", "payments", "ip", "browser", "asn"]
 ACCOUNT_FORMAT_OPTIONS = ["pdf", "xlsx", "csv", "json"]
 ACCOUNT_LIST_MAX_TOP_K = ui_api.SETTINGS.account_list.max_top_k or 500
+from i4g.reports.dossier_signatures import ManifestVerificationReport, verify_manifest_payload
+from i4g.ui.state import ensure_session_defaults
+from i4g.ui.views import render_discovery_engine_panel
 
 
 class SavedSearchDescriptor(TypedDict, total=False):
@@ -121,41 +122,6 @@ def _extract_saved_search_descriptor(source: Optional[Dict[str, Any]]) -> Option
     if descriptor:
         return descriptor
     return None
-
-
-def _combine_saved_search_descriptors(
-    primary: Optional[Dict[str, Any]],
-    secondary: Optional[Dict[str, Any]],
-) -> Optional[SavedSearchDescriptor]:
-    """Merge descriptor hints, preferring the primary source when present."""
-
-    primary_descriptor = _extract_saved_search_descriptor(primary)
-    secondary_descriptor = _extract_saved_search_descriptor(secondary)
-    if not primary_descriptor and not secondary_descriptor:
-        return None
-
-    merged: SavedSearchDescriptor = {}
-    for field in ("id", "name", "owner"):
-        field_value: Optional[str] = None
-        if primary_descriptor:
-            candidate = primary_descriptor.get(field)
-            if isinstance(candidate, str) and candidate.strip():
-                field_value = candidate.strip()
-        if not field_value and secondary_descriptor:
-            candidate = secondary_descriptor.get(field)
-            if isinstance(candidate, str) and candidate.strip():
-                field_value = candidate.strip()
-        if field_value:
-            merged[field] = field_value
-
-    tags: List[str] = []
-    for candidate in (primary_descriptor, secondary_descriptor):
-        if candidate:
-            tags.extend(candidate.get("tags") or [])
-    if tags:
-        merged["tags"] = _normalize_descriptor_tags(tags)
-
-    return merged or None
 
 
 def _default_schema_version() -> Optional[str]:
@@ -427,6 +393,38 @@ def _refresh_intakes(limit: Optional[int] = None) -> None:
         st.session_state["intake_error"] = None
     except Exception as exc:
         st.session_state["intake_error"] = str(exc)
+
+
+def _refresh_dossiers(
+    status: Optional[str] = None,
+    *,
+    limit: Optional[int] = None,
+    include_manifest: Optional[bool] = None,
+) -> None:
+    """Reload dossier queue entries from the reports API."""
+
+    selected_status = (status or st.session_state.get("dossier_status_filter") or "completed").strip()
+    selected_status = selected_status or "completed"
+    selected_limit = int(limit if limit is not None else st.session_state.get("dossier_limit", 20) or 20)
+    include_payload = (
+        include_manifest
+        if include_manifest is not None
+        else bool(st.session_state.get("dossier_include_manifest", False))
+    )
+    try:
+        payload = ui_api.fetch_dossiers(
+            status=selected_status,
+            limit=max(1, min(selected_limit, 200)),
+            include_manifest=include_payload,
+        )
+    except Exception as exc:
+        st.session_state["dossier_error"] = str(exc)
+    else:
+        st.session_state["dossier_items"] = payload.get("items", [])
+        st.session_state["dossier_error"] = None
+        st.session_state["dossier_status_filter"] = selected_status
+        st.session_state["dossier_limit"] = max(1, min(selected_limit, 200))
+        st.session_state["dossier_include_manifest"] = include_payload
 
 
 def _execute_saved_search(
@@ -1238,6 +1236,181 @@ if sources:
             if excerpt:
                 st.write(excerpt)
 
+if not st.session_state.get("dossier_items") and st.session_state.get("dossier_error") is None:
+    _refresh_dossiers()
+
+st.divider()
+st.subheader("📁 Evidence dossiers")
+
+dossier_status_options = ["completed", "pending", "leased", "failed", "all"]
+current_status = st.session_state.get("dossier_status_filter", "completed")
+if current_status not in dossier_status_options:
+    current_status = "completed"
+status_index = dossier_status_options.index(current_status)
+selected_status = st.selectbox(
+    "Queue status",
+    options=dossier_status_options,
+    index=status_index,
+    key="dossier_status_select",
+    help="Filter dossier plans by queue status.",
+)
+st.session_state["dossier_status_filter"] = selected_status
+
+selected_limit = st.slider(
+    "Rows to load",
+    min_value=5,
+    max_value=200,
+    value=int(st.session_state.get("dossier_limit", 20)),
+    help="Clamp large fetches to keep manifest parsing responsive.",
+    key="dossier_limit_slider",
+)
+st.session_state["dossier_limit"] = selected_limit
+
+include_manifest_payloads = st.checkbox(
+    "Include manifest payloads",
+    value=bool(st.session_state.get("dossier_include_manifest", False)),
+    help="When enabled, the full manifest JSON is returned inline (slower but useful for LEA verification).",
+    key="dossier_include_manifest_checkbox",
+)
+st.session_state["dossier_include_manifest"] = include_manifest_payloads
+
+if st.button("Refresh dossiers", key="refresh_dossiers_btn"):
+    _refresh_dossiers(
+        status=selected_status,
+        limit=selected_limit,
+        include_manifest=include_manifest_payloads,
+    )
+
+dossier_error = st.session_state.get("dossier_error")
+if dossier_error:
+    st.error(f"Failed to load dossiers: {dossier_error}")
+
+dossier_records = st.session_state.get("dossier_items") or []
+if dossier_records:
+    st.caption(
+        f"{len(dossier_records)} plan(s) loaded · status filter '{selected_status}' · "
+        f"manifest payloads {'ON' if include_manifest_payloads else 'OFF'}"
+    )
+    verification_cache: Dict[str, ManifestVerificationReport | Dict[str, str]] = st.session_state.setdefault(
+        "dossier_verification_reports",
+        {},
+    )
+    for record in dossier_records:
+        plan_id = record.get("plan_id", "unknown-plan")
+        status_label = record.get("status", "n/a")
+        updated_at = record.get("updated_at", "unknown")
+        header = f"{plan_id} · status={status_label} · updated={updated_at}"
+        with st.expander(header, expanded=False):
+            payload = record.get("payload") or {}
+            cases = payload.get("cases") or []
+            jurisdiction = payload.get("jurisdiction_key") or payload.get("jurisdiction") or "n/a"
+            loss_value = payload.get("total_loss_usd") or payload.get("total_loss") or "unknown"
+            summary_cols = st.columns(4)
+            summary_cols[0].markdown(f"**Jurisdiction**\n\n{jurisdiction}")
+            summary_cols[1].markdown(f"**Total loss (USD)**\n\n{loss_value}")
+            summary_cols[2].markdown(f"**Cases bundled**\n\n{len(cases)}")
+            summary_cols[3].markdown(f"**Queue status**\n\n`{status_label}`")
+
+            queue_warnings = record.get("warnings") or []
+            for warning in queue_warnings:
+                st.warning(f"Queue warning: {warning}")
+            artifact_warnings = record.get("artifact_warnings") or []
+            for warning in artifact_warnings:
+                st.warning(f"Artifact warning: {warning}")
+            if record.get("error"):
+                st.error(f"Queue error: {record['error']}")
+
+            manifest_path = record.get("manifest_path")
+            if manifest_path:
+                st.caption(f"Manifest path: {manifest_path}")
+            signature_path = record.get("signature_manifest_path")
+            if signature_path:
+                st.caption(f"Signature manifest path: {signature_path}")
+
+            manifest_payload = record.get("manifest")
+            safe_plan_key = plan_id.replace("/", "_").replace(":", "-")
+            if manifest_payload:
+                st.markdown("**Manifest preview**")
+                st.json(manifest_payload)
+                st.download_button(
+                    label="Download manifest JSON",
+                    data=json.dumps(manifest_payload, indent=2),
+                    file_name=f"{safe_plan_key}_manifest.json",
+                    mime="application/json",
+                    key=f"manifest_download_{safe_plan_key}",
+                )
+            else:
+                st.caption("Enable manifest payloads to preview/download the manifest inline.")
+
+            signature_manifest = record.get("signature_manifest")
+            if signature_manifest:
+                st.markdown("**Signature manifest**")
+                st.json(signature_manifest)
+            else:
+                st.caption("Signature manifest unavailable or unreadable for this plan.")
+
+            base_path = Path(signature_path).parent if signature_path else None
+            verification_key = f"verify_signatures_{safe_plan_key}"
+            can_verify = isinstance(signature_manifest, dict)
+            verify_disabled = not can_verify
+            verify_help = None
+            if not can_verify:
+                verify_help = (
+                    "Enable manifest payloads to fetch the signature manifest for verification."
+                    if not include_manifest_payloads
+                    else "This plan has not persisted a signature manifest yet."
+                )
+
+            if (
+                st.button(
+                    "Verify signatures",
+                    key=verification_key,
+                    disabled=verify_disabled,
+                    help=verify_help,
+                )
+                and can_verify
+            ):
+                try:
+                    report = verify_manifest_payload(signature_manifest, base_path=base_path)
+                    verification_cache[plan_id] = report
+                except Exception as exc:  # noqa: BLE001
+                    verification_cache[plan_id] = {"error": str(exc)}
+                st.session_state["dossier_verification_reports"] = verification_cache
+
+            verification_report = verification_cache.get(plan_id)
+            if isinstance(verification_report, ManifestVerificationReport):
+                if verification_report.all_verified:
+                    st.success(
+                        f"{len(verification_report.artifacts)} artifact(s) verified with "
+                        f"{verification_report.algorithm}."
+                    )
+                else:
+                    st.warning(
+                        f"{verification_report.missing_count} missing · "
+                        f"{verification_report.mismatch_count} mismatched artifact(s)."
+                    )
+                with st.expander("Verification artifacts", expanded=False):
+                    for artifact in verification_report.artifacts:
+                        artifact_cols = st.columns([2, 1, 1, 2])
+                        artifact_cols[0].markdown(f"**{artifact.label}**")
+                        artifact_cols[1].markdown("✅ present" if artifact.exists else "⚠️ missing")
+                        artifact_cols[2].markdown("✅ hash match" if artifact.matches else "⚠️ hash mismatch")
+                        details = []
+                        if artifact.path:
+                            details.append(str(artifact.path))
+                        if artifact.size_bytes is not None:
+                            details.append(f"{artifact.size_bytes} bytes")
+                        if artifact.error:
+                            details.append(f"error: {artifact.error}")
+                        artifact_cols[3].markdown("\n".join(details) or "No artifact metadata available")
+            elif isinstance(verification_report, dict) and verification_report.get("error"):
+                st.error(f"Verification failed: {verification_report['error']}")
+
+            with st.expander("Dossier plan payload", expanded=False):
+                st.json(payload)
+else:
+    if not dossier_error:
+        st.caption("No dossier plans match the current filters yet.")
 
 if not st.session_state.get("intake_items") and st.session_state.get("intake_error") is None:
     _refresh_intakes()

@@ -18,7 +18,7 @@ import sqlite3
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 from i4g.settings import get_settings
 
@@ -109,8 +109,87 @@ class ReviewStore:
         except sqlite3.OperationalError:
             pass
 
+        self._create_dossier_view(cur)
         conn.commit()
         conn.close()
+
+    def _create_dossier_view(self, cursor: sqlite3.Cursor) -> None:
+        """Create or refresh the dossier candidate metrics view."""
+
+        view_sql = """
+            CREATE VIEW IF NOT EXISTS dossier_candidate_metrics AS
+            WITH raw AS (
+                SELECT
+                    rq.case_id AS case_id,
+                    rq.status AS status,
+                    COALESCE(rq.last_updated, rq.queued_at) AS accepted_at,
+                    CAST(
+                        COALESCE(
+                            json_extract(sr.metadata, '$.loss_amount_usd'),
+                            json_extract(sr.metadata, '$.loss_usd'),
+                            json_extract(sr.metadata, '$.loss_amount'),
+                            json_extract(sr.metadata, '$.loss')
+                        ) AS REAL
+                    ) AS loss_amount_usd,
+                    COALESCE(
+                        json_extract(sr.metadata, '$.jurisdiction'),
+                        json_extract(sr.metadata, '$.victim_jurisdiction'),
+                        json_extract(sr.metadata, '$.victim_state'),
+                        json_extract(sr.metadata, '$.victim_country'),
+                        'unknown'
+                    ) AS jurisdiction,
+                    UPPER(
+                        COALESCE(
+                            json_extract(sr.metadata, '$.victim_country'),
+                            json_extract(sr.metadata, '$.victim_state'),
+                            json_extract(sr.metadata, '$.jurisdiction_country')
+                        )
+                    ) AS victim_country,
+                    UPPER(
+                        COALESCE(
+                            json_extract(sr.metadata, '$.offender_country'),
+                            json_extract(sr.metadata, '$.scammer_country'),
+                            json_extract(sr.metadata, '$.jurisdiction_country')
+                        )
+                    ) AS offender_country
+                FROM review_queue rq
+                LEFT JOIN scam_records sr ON sr.case_id = rq.case_id
+            )
+            SELECT
+                case_id,
+                status,
+                accepted_at,
+                loss_amount_usd,
+                jurisdiction,
+                victim_country,
+                offender_country,
+                CASE
+                    WHEN victim_country IS NOT NULL
+                         AND offender_country IS NOT NULL
+                         AND victim_country <> offender_country
+                    THEN 1
+                    ELSE 0
+                END AS cross_border,
+                CASE
+                    WHEN loss_amount_usd IS NULL THEN 'unknown'
+                    WHEN loss_amount_usd >= 250000 THEN '250k-plus'
+                    WHEN loss_amount_usd >= 100000 THEN '100k-250k'
+                    WHEN loss_amount_usd >= 50000 THEN '50k-100k'
+                    ELSE 'below-50k'
+                END AS loss_band,
+                CASE
+                    WHEN jurisdiction IS NULL OR jurisdiction = '' THEN COALESCE(victim_country, 'unknown')
+                    WHEN instr(jurisdiction, '-') > 0 THEN substr(jurisdiction, 1, instr(jurisdiction, '-') - 1)
+                    ELSE jurisdiction
+                END AS geo_bucket
+            FROM raw
+        """
+        try:
+            cursor.execute("DROP VIEW IF EXISTS dossier_candidate_metrics")
+            cursor.execute(view_sql)
+        except sqlite3.OperationalError:
+            # json_extract is unavailable on some SQLite builds; degrade gracefully.
+            pass
 
     # -------------------------------------------------------------------------
     # Queue management
@@ -146,6 +225,29 @@ class ReviewStore:
             row = conn.execute("SELECT * FROM review_queue WHERE review_id = ?", (review_id,)).fetchone()
         return dict(row) if row else None
 
+    def get_cases(self, case_ids: Iterable[str]) -> Dict[str, Dict[str, Any]]:
+        """Return review queue rows keyed by ``case_id`` for the provided identifiers."""
+
+        normalized: List[str] = []
+        seen: Set[str] = set()
+        for case_id in case_ids:
+            if case_id is None:
+                continue
+            value = str(case_id).strip()
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            normalized.append(value)
+
+        if not normalized:
+            return {}
+
+        placeholders = ",".join("?" for _ in normalized)
+        query = f"SELECT * FROM review_queue WHERE case_id IN ({placeholders})"
+        with self._connect() as conn:
+            rows = conn.execute(query, tuple(normalized)).fetchall()
+        return {str(row["case_id"]): dict(row) for row in rows}
+
     def update_status(self, review_id: str, status: str, notes: Optional[str] = None) -> None:
         """Update the status (accepted/rejected/etc.) and optional notes."""
         now = datetime.now(timezone.utc).isoformat()
@@ -158,6 +260,79 @@ class ReviewStore:
                 """,
                 (status, notes, now, review_id),
             )
+
+    def upsert_queue_entry(
+        self,
+        *,
+        review_id: Optional[str],
+        case_id: str,
+        status: str,
+        queued_at: datetime,
+        priority: str = "medium",
+        last_updated: Optional[datetime] = None,
+        assigned_to: Optional[str] = None,
+        notes: Optional[str] = None,
+    ) -> str:
+        """Insert or replace a queue entry with explicit timestamps."""
+
+        normalized_review_id = review_id or str(uuid.uuid4())
+        queued_iso = _iso_timestamp(queued_at)
+        last_iso = _iso_timestamp(last_updated) if last_updated else queued_iso
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO review_queue (review_id, case_id, queued_at, priority, status, assigned_to, notes, last_updated)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(review_id) DO UPDATE SET
+                    case_id=excluded.case_id,
+                    queued_at=excluded.queued_at,
+                    priority=excluded.priority,
+                    status=excluded.status,
+                    assigned_to=excluded.assigned_to,
+                    notes=excluded.notes,
+                    last_updated=excluded.last_updated
+                """,
+                (
+                    normalized_review_id,
+                    case_id,
+                    queued_iso,
+                    priority,
+                    status,
+                    assigned_to,
+                    notes,
+                    last_iso,
+                ),
+            )
+        return normalized_review_id
+
+    def list_dossier_candidates(self, status: str = "accepted", limit: int = 200) -> List[Dict[str, Any]]:
+        """Return aggregated dossier metrics for queue entries."""
+
+        with self._connect() as conn:
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        case_id,
+                        status,
+                        accepted_at,
+                        loss_amount_usd,
+                        jurisdiction,
+                        victim_country,
+                        offender_country,
+                        cross_border,
+                        loss_band,
+                        geo_bucket
+                    FROM dossier_candidate_metrics
+                    WHERE status = ?
+                    ORDER BY accepted_at DESC
+                    LIMIT ?
+                    """,
+                    (status, limit),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return []
+        return [dict(row) for row in rows]
 
     # -------------------------------------------------------------------------
     # Action logging
@@ -532,3 +707,12 @@ class ReviewStore:
             if self.update_saved_search(search_id, tags=normalized):
                 updated += 1
         return updated
+
+
+def _iso_timestamp(value: Optional[datetime]) -> str:
+    """Return an ISO-8601 string, defaulting to UTC now when value is None."""
+
+    dt = value or datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.isoformat()

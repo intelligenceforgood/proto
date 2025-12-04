@@ -7,6 +7,7 @@ filter metadata, or migrate saved searches after the Milestone 3 upgrades.
 - Volunteer analysts and engineers who triage cases through the FastAPI/Next.js stack.
 - Focus areas: structured filters, `/reviews/search/schema`, saved-search lifecycle, and UI alignment.
 
+
 ## Prerequisites
 - Access to the FastAPI gateway via Identity-Aware Proxy (see `docs/iam.md`).
 - `X-API-KEY` with analyst scope stored in `I4G_API_KEY`.
@@ -166,3 +167,4 @@ Use this checklist when demonstrating or regression-testing the new hybrid-searc
 5. **CLI support.** `scripts/tag_saved_searches.py` plus the updated `i4g-admin` commands share the same schema defaults, so exports/imports retain every filter knob (entities, time ranges, limits). Document any migrations in `planning/change_log.md` before distributing bundles to analysts.
 
 If any of these checks fail, capture the reproduction steps, attach the API payloads, and log an entry in `planning/change_log.md` so the next milestone inherits a clean slate.
+

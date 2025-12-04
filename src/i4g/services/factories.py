@@ -12,10 +12,14 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from i4g.reports.bundle_builder import BundleBuilder
+from i4g.reports.bundle_candidates import BundleCandidateProvider
+from i4g.reports.dossier_context import DossierContextLoader
 from i4g.services.firestore_writer import FirestoreWriter
 from i4g.services.vertex_writer import VertexDocumentWriter
 from i4g.settings import get_settings
 from i4g.storage import EvidenceStorage
+from i4g.store.dossier_queue_store import DossierQueueStore
 from i4g.store.entity_store import EntityStore
 from i4g.store.ingestion_retry_store import IngestionRetryStore
 from i4g.store.ingestion_run_tracker import IngestionRunTracker
@@ -212,6 +216,49 @@ def build_firestore_writer(*, settings: "Settings" | None = None) -> FirestoreWr
     return FirestoreWriter(project=project, collection=collection)
 
 
+def build_dossier_queue_store(db_path: str | Path | None = None) -> DossierQueueStore:
+    """Return a DossierQueueStore instance backed by the configured SQLite DB."""
+
+    return DossierQueueStore(db_path=db_path)
+
+
+def build_bundle_builder(
+    *,
+    queue_store: DossierQueueStore | None = None,
+    shared_drive_parent_id: str | None = None,
+) -> BundleBuilder:
+    """Instantiate a BundleBuilder with Drive metadata derived from settings."""
+
+    settings = get_settings()
+    parent_id = shared_drive_parent_id or settings.report.drive_parent_id
+    store = queue_store or build_dossier_queue_store()
+    return BundleBuilder(queue_store=store, shared_drive_parent_id=parent_id)
+
+
+def build_bundle_candidate_provider(
+    *,
+    review_store: ReviewStore | None = None,
+    structured_store: StructuredStore | None = None,
+) -> BundleCandidateProvider:
+    """Return a provider that yields dossier candidates from accepted reviews."""
+
+    resolved_review = review_store or build_review_store()
+    resolved_structured = structured_store or build_structured_store()
+    return BundleCandidateProvider(review_store=resolved_review, structured_store=resolved_structured)
+
+
+def build_dossier_context_loader(
+    *,
+    structured_store: StructuredStore | None = None,
+    review_store: ReviewStore | None = None,
+) -> DossierContextLoader:
+    """Instantiate a context loader that hydrates dossier cases with metadata."""
+
+    resolved_structured = structured_store or build_structured_store()
+    resolved_review = review_store or build_review_store()
+    return DossierContextLoader(structured_store=resolved_structured, review_store=resolved_review)
+
+
 __all__ = [
     "build_structured_store",
     "build_entity_store",
@@ -224,4 +271,8 @@ __all__ = [
     "build_ingestion_retry_store",
     "build_vertex_writer",
     "build_firestore_writer",
+    "build_dossier_queue_store",
+    "build_bundle_builder",
+    "build_bundle_candidate_provider",
+    "build_dossier_context_loader",
 ]
