@@ -36,7 +36,8 @@ def _sample_plan(plan_id: str = "dossier-us-ca-20251203-01") -> DossierPlan:
 
 
 def test_dossier_generator_writes_manifest(tmp_path) -> None:
-    generator = DossierGenerator(artifact_dir=tmp_path, context_loader=_StaticContextLoader())
+    artifact_dir = tmp_path / "artifacts"
+    generator = DossierGenerator(artifact_dir=artifact_dir, context_loader=_StaticContextLoader())
     plan = _sample_plan()
 
     result = generator.generate_from_plan(plan)
@@ -56,20 +57,25 @@ def test_dossier_generator_writes_manifest(tmp_path) -> None:
     assert payload["context"]["cases"][0]["structured_record"]["case_id"] == "case-1"
     assert payload["context"]["warnings"] == ["case-warning"]
     assets = payload["assets"]
-    assert assets["timeline_chart"].endswith(".png")
-    assert Path(assets["timeline_chart"]).exists()
-    assert assets["geojson"].endswith(".json")
-    assert Path(assets["geojson"]).exists()
-    assert assets["geo_map_image"].endswith(".png")
-    assert Path(assets["geo_map_image"]).exists()
+    timeline_path = (artifact_dir / assets["timeline_chart"]).resolve()
+    assert timeline_path.exists()
+    geojson_path = (artifact_dir / assets["geojson"]).resolve()
+    assert geojson_path.exists()
+    geo_map_path = (artifact_dir / assets["geo_map_image"]).resolve()
+    assert geo_map_path.exists()
+    template_render = payload["template_render"]
+    assert template_render["path"].endswith(".md")
+    markdown_path = (artifact_dir / template_render["path"]).resolve()
+    assert markdown_path.exists()
     signature_info = payload["signature_manifest"]
-    signature_path = Path(signature_info["path"])
+    signature_path = (artifact_dir / signature_info["path"]).resolve()
     assert signature_info["algorithm"] == "sha256"
     assert signature_path.exists()
     signature_payload = json.loads(signature_path.read_text())
     assert signature_payload["algorithm"] == "sha256"
     assert signature_payload["artifacts"][0]["label"] == "manifest"
     assert signature_payload["artifacts"][0]["path"].endswith(f"{plan.plan_id}.json")
+    assert any(Path(path).suffix == ".md" for path in result.artifacts)
     assert result.warnings == ["case-warning"]
 
 
@@ -88,7 +94,7 @@ def test_processor_completes_and_marks_queue(tmp_path) -> None:
     assert entry and entry["status"] == "completed"
     assert entry["warnings"] == []
     artifact_paths = [Path(path) for path in summary.plans[0]["artifacts"]]
-    assert len(artifact_paths) == 2
+    assert len(artifact_paths) == 3
     assert all(path.exists() for path in artifact_paths)
 
 

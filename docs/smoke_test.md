@@ -310,6 +310,41 @@ printed to STDOUT so you can verify Drive/`gs://` uploads or inspect the local f
 
 Document successful runs (or failures) in `planning/change_log.md` when they drive code or infrastructure updates.
 
+### 5. Dossier Queue Job (Local)
+
+Use this flow to exercise the dossier queue + generator end-to-end on your laptop before enabling the Cloud Run job.
+
+1. **Seed pilot cases and enqueue plans.** The helper writes curated pilot cases into the structured + review stores and
+  drops queue entries ready for processing:
+  ```bash
+  conda run -n i4g i4g-admin pilot-dossiers --case-count 3
+  ```
+  Expect `✅ Enqueued ... pilot plan(s)` along with any warnings for missing pilot case IDs.
+2. **Optional dry run.** Inspect the queue without rendering artifacts by setting the job’s dry-run flag:
+  ```bash
+  env I4G_DOSSIER__BATCH_SIZE=2 I4G_DOSSIER__DRY_RUN=true I4G_RUNTIME__LOG_LEVEL=INFO \
+    conda run -n i4g i4g-dossier-job
+  ```
+  Logs should report `Dossier queue job complete ... dry_run=True` and leave the queue entries untouched.
+3. **Generate dossiers.** Clear the dry-run flag to render markdown + manifest artifacts under
+  `data/reports/dossiers/`:
+  ```bash
+  env I4G_DOSSIER__BATCH_SIZE=2 I4G_RUNTIME__LOG_LEVEL=INFO conda run -n i4g i4g-dossier-job
+  ```
+  Each processed plan emits `{plan_id}.json`, `{plan_id}.md`, and `{plan_id}.signatures.json` plus chart assets in
+  `data/reports/dossiers/assets/`.
+4. **Verify queue + artifacts.** Use the CLI or SQLite shell to confirm the queue rows transitioned to `completed`:
+  ```bash
+  conda run -n i4g i4g-admin process-dossiers --batch-size 3 --dry-run --preview 3
+  ls -1 data/reports/dossiers/*.json
+  ```
+  Inspect a manifest to ensure the signature file path and warnings look reasonable:
+  ```bash
+  jq '{plan_id, signature: .signature_manifest}' data/reports/dossiers/dossier-*.json | head -n 40
+  ```
+  Record the run (case count, warnings, hash highlights) in `planning/change_log.md` so Cloud Run parity checks have a
+  known baseline.
+
 ## GCP Smoke Tests (Dev Environment)
 
 These steps ensure the deployed services, Cloud Run jobs, and shared storage paths cooperate in the dev project. Authenticate with `gcloud auth login` (and `gcloud config set project i4g-dev`) before continuing.
@@ -613,3 +648,38 @@ I4G_RUNTIME__LOG_LEVEL=INFO
    Then run the analyst console smoke from the `ui/` repo (see the "Analyst console" section above) and
    confirm the indicator chips for `network_smoke` cases render. Log the ingest run ID plus any UI
    observations in `planning/change_log.md`.
+
+### 8. Dossier Queue Job (Dev)
+
+Validate the Cloud Run job that consumes dossier queue entries and publishes artifacts to the shared drive / storage.
+
+1. **Seed pilot data in dev.** Point the admin helper at the dev profile so pilot cases and queue entries exist in the
+  remote database:
+  ```bash
+  env I4G_ENV=dev conda run -n i4g i4g-admin pilot-dossiers --case-count 3
+  ```
+2. **Execute the Cloud Run job.** The Terraform-managed job is named `dossier-queue`. Override the batch size (and
+  optionally enable dry run) per execution:
+  ```bash
+  gcloud run jobs execute dossier-queue \
+    --project i4g-dev \
+    --region us-central1 \
+    --wait \
+    --container=container-0 \
+    --update-env-vars=I4G_DOSSIER__BATCH_SIZE=2,I4G_DOSSIER__DRY_RUN=false
+  ```
+  Expect the CLI to print `Execution [...] has successfully completed.`
+3. **Review logs and queue status.**
+  ```bash
+  gcloud logging read \
+    "resource.type=cloud_run_job AND resource.labels.job_name=dossier-queue" \
+    --project i4g-dev --limit 50 --format text
+
+  curl -sS -H "X-API-KEY: dev-analyst-token" \
+    "https://fastapi-gateway-y5jge5w2cq-uc.a.run.app/reports/dossiers?status=completed&limit=5" | \
+    jq '{count, plans: [.items[].plan_id]}'
+  ```
+  Logs should show `Dossier queue job complete` along with the processed/completed counts. The API call confirms plan
+  statuses flipped to `completed` and surfaces signature-manifest paths for downstream LEA workflows.
+4. **Capture evidence.** Store the execution name, queue status, and any warnings (missing assets, signature mismatches)
+  in `planning/change_log.md`. Repeat the smoke whenever you change dossier templates, tool outputs, or queue settings.

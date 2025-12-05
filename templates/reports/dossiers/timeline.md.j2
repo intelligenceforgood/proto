@@ -1,0 +1,11 @@
+## Timeline of Key Events
+
+{% if tools and tools.timeline_synthesizer and tools.timeline_synthesizer.events %}
+| Timestamp | Case | Summary | Loss |
+| --- | --- | --- | --- |
+{% for event in tools.timeline_synthesizer.events %}
+| {{ event.timestamp }} | {{ event.case_id }} | {{ event.summary }} | ${{ event.loss_amount_usd }} |
+{% endfor %}
+{% else %}
+_No timeline events were synthesized for this dossier._
+{% endif %}

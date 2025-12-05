@@ -1,0 +1,16 @@
+## Appendix & Assets
+
+{% if tools and tools.chart_renderer %}
+- **Timeline chart:** {{ tools.chart_renderer.timeline_chart or 'not generated' }}
+- **Geo map:** {{ tools.chart_renderer.geo_map_image or 'not generated' }}
+- **GeoJSON:** {{ tools.chart_renderer.geojson_path or 'not generated' }}
+- **Renderer warnings:** {% if tools.chart_renderer.warnings %}{{ tools.chart_renderer.warnings | join('; ') }}{% else %}None{% endif %}
+{% endif %}
+
+{% if assets and assets.warnings %}
+- **Asset pipeline warnings:** {{ assets.warnings | join('; ') }}
+{% endif %}
+
+{% if tools and tools.narrative_report %}
+> _Narrative confidence: {{ tools.narrative_report.confidence }}_
+{% endif %}

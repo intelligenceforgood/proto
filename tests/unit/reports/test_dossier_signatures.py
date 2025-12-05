@@ -97,3 +97,46 @@ def test_verify_manifest_payload_detects_mismatch(tmp_path) -> None:
     assert report.mismatch_count == 1
     assert report.artifacts[0].matches is False
     assert report.all_verified is False
+
+
+def test_verify_manifest_payload_resolves_relative_paths(tmp_path) -> None:
+    base_dir = tmp_path / "artifacts"
+    base_dir.mkdir()
+    artifact = base_dir / "relative.json"
+    artifact.write_text("payload")
+    expected_hash = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    manifest_payload = {
+        "algorithm": "sha256",
+        "artifacts": [
+            {
+                "label": "manifest",
+                "path": artifact.name,
+                "hash": expected_hash,
+            }
+        ],
+    }
+
+    report = verify_manifest_payload(manifest_payload, base_path=base_dir)
+
+    assert report.all_verified is True
+    resolved_path = report.artifacts[0].path
+    assert resolved_path == artifact.resolve()
+
+
+def test_verify_manifest_payload_warns_when_hash_missing(tmp_path) -> None:
+    artifact = tmp_path / "missing-hash.json"
+    artifact.write_text("payload")
+    manifest_payload = {
+        "algorithm": "sha256",
+        "artifacts": [
+            {
+                "label": "manifest",
+                "path": str(artifact),
+            }
+        ],
+    }
+
+    report = verify_manifest_payload(manifest_payload)
+
+    assert report.artifacts[0].expected_hash is None
+    assert any("missing expected hash" in warning for warning in report.warnings)

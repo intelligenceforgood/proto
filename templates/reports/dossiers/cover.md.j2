@@ -1,0 +1,16 @@
+# Evidence Dossier — {{ plan.plan_id }}
+
+- **Created:** {{ plan.created_at }}
+- **Jurisdiction Focus:** {{ plan.jurisdiction_key }}
+- **Cases Bundled:** {{ analysis.case_count }}
+- **Total Estimated Loss:** ${{ analysis.total_loss_usd }}
+- **Bundle Rationale:** {{ plan.bundle_reason }}
+- **Cross-Border:** {{ 'Yes' if plan.cross_border else 'No' }}
+
+{% if tools and tools.narrative_report %}
+{{ tools.narrative_report.summary }}
+
+> Risk posture: {{ tools.narrative_report.risk_level }} · Recommended action: {{ tools.narrative_report.recommendation }}
+{% else %}
+_Subject-matter summary pending._
+{% endif %}

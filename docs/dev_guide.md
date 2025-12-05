@@ -640,6 +640,9 @@ docker buildx build \
     .
 ```
 
+Run through the dedicated dossier deployment checklist (`docs/runbooks/dossiers_deployment_checklist.md`) before
+applying Cloud Run overrides so smoke tests, env vars, and Task_STATUS hooks stay in sync across environments.
+
 By default the ingestion job runs against `/app/data/retrieval_poc/cases.jsonl` packaged in the container and skips embeddings unless `I4G_INGEST__ENABLE_VECTOR=true` is supplied, allowing the Cloud Run job to succeed without an external Ollama endpoint. Terraform injects `I4G_ENV` and the Dockerfile sets `I4G_RUNTIME__PROJECT_ROOT=/app`, so structured-store writes land in `/app/data` unless overridden.
 
 > ⚠️  Reminder: `data/retrieval_poc` only seeds the prototype. Plan to remove the dataset from local workstations and job images once production ingestion sources are wired up.

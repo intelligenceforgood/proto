@@ -43,6 +43,9 @@ def test_visual_builder_combines_assets(tmp_path) -> None:
     snapshot = assets.to_dict()
     assert snapshot["timeline_chart"].endswith(".png")
     assert snapshot["geojson"].endswith(".json")
+    relative_snapshot = assets.to_dict(relative_to=tmp_path)
+    assert relative_snapshot["timeline_chart"].startswith("assets/")
+    assert relative_snapshot["geojson"].startswith("assets/")
 
 
 def _plan(jurisdictions: tuple[str, str]) -> DossierPlan:

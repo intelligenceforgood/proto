@@ -1,5 +1,5 @@
 {
-  "generated_at": "2025-12-02T16:30:10.375447+00:00",
+  "generated_at": "2025-12-05T15:12:36.420332+00:00",
   "source": "src/i4g/settings/config.py",
   "env_prefix": "I4G_",
   "fields": [
@@ -139,7 +139,7 @@
       "path": "data_dir",
       "section": "data_dir",
       "type": "Path",
-      "default": "/Users/jerry/Work/project/i4g/data",
+      "default": "/Users/jerry/Work/project/i4g/proto/data",
       "env_vars": [
         "I4G_DATA_DIR"
       ],
@@ -236,7 +236,7 @@
       "path": "ingestion.dataset_path",
       "section": "ingestion",
       "type": "Path",
-      "default": "/Users/jerry/Work/project/i4g/data/retrieval_poc/cases.jsonl",
+      "default": "/Users/jerry/Work/project/i4g/proto/data/retrieval_poc/cases.jsonl",
       "env_vars": [
         "I4G_INGESTION__DATASET_PATH",
         "INGEST_JSONL_PATH",
@@ -606,11 +606,86 @@
       "path": "project_root",
       "section": "project_root",
       "type": "Path",
-      "default": "/Users/jerry/Work/project/i4g",
+      "default": "/Users/jerry/Work/project/i4g/proto",
       "env_vars": [
-        "I4G_PROJECT_ROOT"
+        "I4G_PROJECT_ROOT",
+        "PROJECT_ROOT",
+        "RUNTIME__PROJECT_ROOT",
+        "I4G_RUNTIME__PROJECT_ROOT"
       ],
       "description": "Top-level configuration model with nested sections for each subsystem."
+    },
+    {
+      "path": "report.drive_parent_id",
+      "section": "report",
+      "type": "str | NoneType",
+      "default": null,
+      "env_vars": [
+        "I4G_REPORT__DRIVE_PARENT_ID",
+        "REPORT_DRIVE_PARENT_ID",
+        "REPORT__DRIVE_PARENT_ID"
+      ],
+      "description": "Agentic dossier/report configuration."
+    },
+    {
+      "path": "report.hash_algorithm",
+      "section": "report",
+      "type": "str",
+      "default": "sha256",
+      "env_vars": [
+        "I4G_REPORT__HASH_ALGORITHM",
+        "REPORT_HASH_ALGORITHM",
+        "REPORT__HASH_ALGORITHM"
+      ],
+      "description": "Agentic dossier/report configuration."
+    },
+    {
+      "path": "report.max_cases_per_dossier",
+      "section": "report",
+      "type": "int",
+      "default": 5,
+      "env_vars": [
+        "I4G_REPORT__MAX_CASES_PER_DOSSIER",
+        "REPORT_MAX_CASES_PER_DOSSIER",
+        "REPORT__MAX_CASES_PER_DOSSIER"
+      ],
+      "description": "Agentic dossier/report configuration."
+    },
+    {
+      "path": "report.min_loss_usd",
+      "section": "report",
+      "type": "float",
+      "default": 50000.0,
+      "env_vars": [
+        "I4G_REPORT__MIN_LOSS_USD",
+        "REPORT_MIN_LOSS_USD",
+        "REPORT__MIN_LOSS_USD"
+      ],
+      "description": "Agentic dossier/report configuration."
+    },
+    {
+      "path": "report.recency_days",
+      "section": "report",
+      "type": "int",
+      "default": 30,
+      "env_vars": [
+        "I4G_REPORT__RECENCY_DAYS",
+        "REPORT_RECENCY_DAYS",
+        "REPORT__RECENCY_DAYS"
+      ],
+      "description": "Agentic dossier/report configuration."
+    },
+    {
+      "path": "report.require_cross_border",
+      "section": "report",
+      "type": "bool",
+      "default": false,
+      "env_vars": [
+        "I4G_REPORT__REQUIRE_CROSS_BORDER",
+        "REPORT_REQUIRE_CROSS_BORDER",
+        "REPORT__REQUIRE_CROSS_BORDER"
+      ],
+      "description": "Agentic dossier/report configuration."
     },
     {
       "path": "runtime.log_level",
@@ -864,7 +939,7 @@
       "path": "storage.evidence_local_dir",
       "section": "storage",
       "type": "Path",
-      "default": "/Users/jerry/Work/project/i4g/data/evidence",
+      "default": "/Users/jerry/Work/project/i4g/proto/data/evidence",
       "env_vars": [
         "I4G_STORAGE__EVIDENCE_LOCAL_DIR",
         "STORAGE_EVIDENCE_LOCAL_DIR",
@@ -910,7 +985,7 @@
       "path": "storage.sqlite_path",
       "section": "storage",
       "type": "Path",
-      "default": "/Users/jerry/Work/project/i4g/data/i4g_store.db",
+      "default": "/Users/jerry/Work/project/i4g/proto/data/i4g_store.db",
       "env_vars": [
         "I4G_STORAGE__SQLITE_PATH"
       ],
@@ -944,7 +1019,7 @@
       "path": "vector.chroma_dir",
       "section": "vector",
       "type": "Path",
-      "default": "/Users/jerry/Work/project/i4g/data/chroma_store",
+      "default": "/Users/jerry/Work/project/i4g/proto/data/chroma_store",
       "env_vars": [
         "I4G_VECTOR__CHROMA_DIR"
       ],
@@ -978,7 +1053,7 @@
       "path": "vector.faiss_dir",
       "section": "vector",
       "type": "Path",
-      "default": "/Users/jerry/Work/project/i4g/data/faiss_store",
+      "default": "/Users/jerry/Work/project/i4g/proto/data/faiss_store",
       "env_vars": [
         "I4G_VECTOR__FAISS_DIR",
         "VECTOR_FAISS_DIR",

@@ -1,0 +1,16 @@
+## Entity Graph Summary
+
+{% if tools and tools.entity_graph and tools.entity_graph.entities %}
+- **Distinct entities:** {{ tools.entity_graph.entity_count }}
+- **Dense clusters:**
+{% for cluster in tools.entity_graph.top_clusters %}
+  - {{ cluster.entity }} ({{ cluster.count }} linked cases)
+{% endfor %}
+
+### Entity → Case Mapping
+{% for entity, cases in tools.entity_graph.entities.items() %}
+- **{{ entity }}** → {{ cases | join(', ') }}
+{% endfor %}
+{% else %}
+_No overlapping entities detected across bundled cases._
+{% endif %}

@@ -89,6 +89,8 @@ def generate_signature_manifest(
     entries: Iterable[tuple[str, Path | None]],
     *,
     algorithm: str = "sha256",
+    generated_at: datetime | None = None,
+    relative_to: Path | None = None,
 ) -> SignatureManifest:
     """Compute the signature manifest for the provided artifact entries."""
 
@@ -105,11 +107,21 @@ def generate_signature_manifest(
             continue
         hash_value = _hash_file(resolved, algorithm=algorithm)
         size_bytes = resolved.stat().st_size
-        artifacts.append(ArtifactSignature(label=label, path=resolved, size_bytes=size_bytes, hash_value=hash_value))
+        manifest_path = resolved
+        if relative_to is not None:
+            base_path = Path(relative_to).resolve()
+            try:
+                manifest_path = resolved.resolve().relative_to(base_path)
+            except ValueError:
+                manifest_path = resolved
+        artifacts.append(
+            ArtifactSignature(label=label, path=manifest_path, size_bytes=size_bytes, hash_value=hash_value)
+        )
 
+    timestamp = generated_at or datetime.now(timezone.utc)
     return SignatureManifest(
         algorithm=algorithm,
-        generated_at=datetime.now(timezone.utc),
+        generated_at=timestamp,
         artifacts=tuple(artifacts),
         warnings=tuple(warnings),
     )

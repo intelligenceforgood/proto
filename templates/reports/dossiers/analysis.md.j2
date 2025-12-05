@@ -1,0 +1,18 @@
+## Analytical Snapshot
+
+- **Accepted Range:** {{ analysis.accepted_range.earliest }} → {{ analysis.accepted_range.latest }}
+- **Loss by Jurisdiction:**
+{% for jurisdiction, value in analysis.loss_by_jurisdiction.items() %}
+  - {{ jurisdiction }} · ${{ value }}
+{% endfor %}
+- **Cross-Border Cases:** {% if analysis.cross_border_cases %}{{ analysis.cross_border_cases | join(', ') }}{% else %}None recorded{% endif %}
+
+{% if tools and tools.geo_reasoner %}
+### Geographic Highlights
+- Dominant regions: {{ tools.geo_reasoner.primary_regions | join(', ') if tools.geo_reasoner.primary_regions else '—' }}
+- Jurisdiction counts:
+{% for jurisdiction, count in tools.geo_reasoner.jurisdiction_counts.items() %}
+  - {{ jurisdiction }}: {{ count }}
+{% endfor %}
+- Warnings: {% if tools.geo_reasoner.warnings %}{{ tools.geo_reasoner.warnings | join('; ') }}{% else %}None{% endif %}
+{% endif %}

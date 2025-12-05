@@ -67,15 +67,28 @@ class DossierVisualAssets:
     geo_map_image: Path | None
     warnings: Sequence[str] = field(default_factory=tuple)
 
-    def to_dict(self) -> dict:
+    def to_dict(self, *, relative_to: Path | None = None) -> dict:
         """Return a JSON-serializable payload describing generated assets."""
 
-        return {
+        payload = {
             "timeline_chart": str(self.timeline_chart) if self.timeline_chart else None,
             "geojson": str(self.geojson_path) if self.geojson_path else None,
             "geo_map_image": str(self.geo_map_image) if self.geo_map_image else None,
             "warnings": list(self.warnings),
         }
+        if not relative_to:
+            return payload
+        base_path = Path(relative_to).resolve()
+        for key in ("timeline_chart", "geojson", "geo_map_image"):
+            value = payload.get(key)
+            if not value:
+                continue
+            candidate = Path(value)
+            try:
+                payload[key] = str(candidate.resolve().relative_to(base_path))
+            except (FileNotFoundError, ValueError):
+                payload[key] = str(candidate.resolve()) if candidate.exists() else str(candidate)
+        return payload
 
 
 class LossTimelineRenderer:

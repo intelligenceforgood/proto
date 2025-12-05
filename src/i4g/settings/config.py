@@ -16,15 +16,23 @@ ENV_VAR_NAME = "I4G_ENV"
 DEFAULT_ENV = "local"
 
 
-def _detect_project_root() -> Path:
-    """Return the repository root, honoring ``I4G_PROJECT_ROOT`` when set."""
+def _env_project_root(var_name: str) -> Path | None:
+    """Resolve an override path from the provided environment variable."""
 
-    env_override = os.getenv("I4G_PROJECT_ROOT")
-    if env_override:
-        candidate = Path(env_override).expanduser()
-        if not candidate.is_absolute():
-            candidate = candidate.resolve()
-        return candidate
+    raw_value = os.getenv(var_name)
+    if not raw_value:
+        return None
+    candidate = Path(raw_value).expanduser().resolve()
+    return candidate
+
+
+def _detect_project_root() -> Path:
+    """Return the repository root, honoring environment overrides when set."""
+
+    for env_var in ("I4G_PROJECT_ROOT", "I4G_RUNTIME__PROJECT_ROOT"):
+        candidate = _env_project_root(env_var)
+        if candidate:
+            return candidate
 
     resolved = Path(__file__).resolve()
     for parent in resolved.parents:
@@ -704,7 +712,7 @@ class Settings(BaseSettings):
     )
     project_root: Path = Field(
         default=PROJECT_ROOT,
-        # validation_alias=AliasChoices("PROJECT_ROOT", "RUNTIME__PROJECT_ROOT"),
+        validation_alias=AliasChoices("PROJECT_ROOT", "RUNTIME__PROJECT_ROOT", "I4G_RUNTIME__PROJECT_ROOT"),
     )
     data_dir: Path = Field(
         default_factory=lambda: PROJECT_ROOT / "data",
